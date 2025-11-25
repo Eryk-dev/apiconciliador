@@ -967,8 +967,8 @@ async def conciliar(
 
             if clean_json:
                 # Remove campos JSON mal formatados (METADATA com aspas internas não escapadas)
-                # Usa regex greedy para capturar todo o JSON entre "{ e }"
-                content_str = re.sub(r'"\{.*\}"', '""', content_str)
+                # Pattern captura desde "{ até }" incluindo JSON aninhado
+                content_str = re.sub(r'"\{[^}]*(?:\{[^}]*\}[^}]*)*\}"', '""', content_str)
 
             # Detectar separador automaticamente (verifica primeira linha após skip_rows)
             lines = content_str.split('\n')
