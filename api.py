@@ -23,7 +23,7 @@ import tempfile
 import shutil
 from datetime import datetime
 from typing import Optional, Dict, List, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -53,12 +53,13 @@ def clean_float_extrato(val) -> float:
     return float(val)
 
 
-def processar_conciliacao(arquivos: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str = "NETAIR") -> Dict[str, Any]:
     """
     Processa a conciliação dos relatórios do Mercado Livre.
 
     Args:
         arquivos: Dicionário com DataFrames dos relatórios
+        centro_custo: Centro de custo para os lançamentos (padrão: NETAIR)
 
     Returns:
         Dicionário com os DataFrames processados e estatísticas
@@ -160,7 +161,7 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         'DIFAL': "2.2.3 DIFAL (Diferencial de Alíquota)",
         'OUTROS': "2.14.8 Despesas Eventuais"
     }
-    CENTRO_CUSTO = "NETAIR"
+    CENTRO_CUSTO = centro_custo
 
     # Mapa de origem da venda
     map_origem_venda = {}
@@ -904,7 +905,8 @@ async def conciliar(
     pos_venda: UploadFile = File(..., description="Arquivo after_collection (pós venda)"),
     liberacoes: UploadFile = File(..., description="Arquivo reserve-release (liberações)"),
     extrato: UploadFile = File(..., description="Arquivo account_statement (extrato)"),
-    retirada: Optional[UploadFile] = File(None, description="Arquivo withdraw (retirada) - opcional")
+    retirada: Optional[UploadFile] = File(None, description="Arquivo withdraw (retirada) - opcional"),
+    centro_custo: str = Form("NETAIR", description="Centro de custo para os lançamentos")
 ):
     """
     Processa os relatórios do Mercado Livre e retorna um ZIP com os arquivos de importação.
@@ -916,6 +918,9 @@ async def conciliar(
     - **liberacoes**: reserve-release report (obrigatório)
     - **extrato**: account_statement report (obrigatório)
     - **retirada**: withdraw report (opcional)
+
+    ## Parâmetros adicionais:
+    - **centro_custo**: Centro de custo para os lançamentos (padrão: NETAIR)
 
     ## Arquivos de saída (ZIP):
     - IMPORTACAO_CONTA_AZUL_CONFIRMADOS.csv
@@ -990,7 +995,7 @@ async def conciliar(
 
         # Processar conciliação
         try:
-            resultado = processar_conciliacao(arquivos)
+            resultado = processar_conciliacao(arquivos, centro_custo=centro_custo)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Erro ao processar conciliação: {str(e)}")
 
