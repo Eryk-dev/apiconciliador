@@ -373,8 +373,13 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
             # LIBERAÇÃO DE DINHEIRO (ou transação com detalhamento no arquivo de liberações)
             # Verifica se é liberação OU se tem dados no map_proporcoes (venda com PIX no extrato)
+            # IMPORTANTE: Alguns tipos de transação NÃO devem usar map_proporcoes mesmo tendo o mesmo op_id
+            # Eles são tratados por seus handlers específicos mais abaixo
             is_liberacao = 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower
-            has_proporcoes = op_id in map_proporcoes
+            is_debito_divida = 'débito por dívida' in tipo_lower or 'debito por divida' in tipo_lower
+            is_dinheiro_retido = 'dinheiro retido' in tipo_lower
+            is_reembolso_tipo = tipo_transacao.strip().startswith('Reembolso')
+            has_proporcoes = op_id in map_proporcoes and not is_debito_divida and not is_dinheiro_retido and not is_reembolso_tipo
 
             if is_liberacao or has_proporcoes:
                 if op_id in map_proporcoes:
@@ -531,6 +536,20 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                         'Descrição': final_desc,
                         'Observações': obs_reemb
                     })
+                continue
+
+            # DÉBITO POR DÍVIDA (devolução ao cliente por reclamação/disputa)
+            if 'débito por dívida' in tipo_lower or 'debito por divida' in tipo_lower:
+                rows_conta_azul_confirmados.append({
+                    'ID Operação': op_id,
+                    'Data de Competência': data_str,
+                    'Data de Pagamento': data_str,
+                    'Categoria': CA_CATS['DEVOLUCAO'],
+                    'Valor': val,
+                    'Centro de Custo': CENTRO_CUSTO,
+                    'Descrição': final_desc,
+                    'Observações': "Devolução por reclamação"
+                })
                 continue
 
             # DINHEIRO RETIDO
