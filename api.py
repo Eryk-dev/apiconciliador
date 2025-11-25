@@ -356,6 +356,21 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                 })
                 continue
 
+            # PAGAMENTO DE FATURA DO CARTÃO DE CRÉDITO MERCADO PAGO
+            # Deve ir para transferências, não é receita
+            if 'pagamento' in tipo_lower and 'cartão de crédito' in tipo_lower:
+                rows_transferencias.append({
+                    'ID Operação': op_id,
+                    'Data de Competência': data_str,
+                    'Data de Pagamento': data_str,
+                    'Categoria': CA_CATS['TRANSFERENCIA'],
+                    'Valor': val,
+                    'Centro de Custo': "",
+                    'Descrição': final_desc,
+                    'Observações': "Pagamento fatura cartão MP"
+                })
+                continue
+
             # LIBERAÇÃO DE DINHEIRO (ou transação com detalhamento no arquivo de liberações)
             # Verifica se é liberação OU se tem dados no map_proporcoes (venda com PIX no extrato)
             is_liberacao = 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower
