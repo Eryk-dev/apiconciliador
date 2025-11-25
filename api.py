@@ -941,7 +941,7 @@ async def conciliar(
         # Carregar DataFrames dos arquivos enviados
         arquivos = {}
 
-        # Função auxiliar para ler CSV
+        # Função auxiliar para ler CSV com detecção automática de separador
         async def ler_csv(upload_file: UploadFile, key: str, skip_rows: int = 0, clean_json: bool = False):
             content = await upload_file.read()
             content_str = content.decode('utf-8')
@@ -950,9 +950,16 @@ async def conciliar(
                 # Remove campos JSON mal formatados
                 content_str = re.sub(r'\"\[\{.*?\}\]\"', '\"JSON_REMOVED\"', content_str)
 
+            # Detectar separador automaticamente (verifica primeira linha após skip_rows)
+            lines = content_str.split('\n')
+            header_line = lines[skip_rows] if len(lines) > skip_rows else lines[0]
+
+            # Conta ocorrências de ; e , na linha de cabeçalho
+            sep = ';' if header_line.count(';') > header_line.count(',') else ','
+
             return pd.read_csv(
                 io.StringIO(content_str),
-                sep=';',
+                sep=sep,
                 skiprows=skip_rows,
                 on_bad_lines='skip',
                 index_col=False
