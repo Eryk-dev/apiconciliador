@@ -356,8 +356,12 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                 })
                 continue
 
-            # LIBERAÇÃO DE DINHEIRO
-            if 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower:
+            # LIBERAÇÃO DE DINHEIRO (ou transação com detalhamento no arquivo de liberações)
+            # Verifica se é liberação OU se tem dados no map_proporcoes (venda com PIX no extrato)
+            is_liberacao = 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower
+            has_proporcoes = op_id in map_proporcoes
+
+            if is_liberacao or has_proporcoes:
                 if op_id in map_proporcoes:
                     props = map_proporcoes[op_id]
                     val_receita = props['receita']
@@ -947,14 +951,15 @@ async def conciliar(
             content_str = content.decode('utf-8')
 
             if clean_json:
-                # Remove campos JSON mal formatados
-                content_str = re.sub(r'\"\[\{.*?\}\]\"', '\"JSON_REMOVED\"', content_str)
+                # Remove campos JSON mal formatados (METADATA com aspas internas não escapadas)
+                # Pattern captura desde "{ até }" incluindo JSON aninhado
+                content_str = re.sub(r'"\{[^}]*(?:\{[^}]*\}[^}]*)*\}"', '""', content_str)
 
             # Detectar separador automaticamente (verifica primeira linha após skip_rows)
             lines = content_str.split('\n')
             header_line = lines[skip_rows] if len(lines) > skip_rows else lines[0]
 
-            # Conta ocorrências de ; e , na linha de cabeçalho
+            # Conta ocorrências de ; e , na linha de cabeçalho (fora de aspas)
             sep = ';' if header_line.count(';') > header_line.count(',') else ','
 
             return pd.read_csv(
@@ -982,7 +987,7 @@ async def conciliar(
             raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'pos_venda': {str(e)}")
 
         try:
-            arquivos['liberacoes'] = await ler_csv(liberacoes, 'liberacoes')
+            arquivos['liberacoes'] = await ler_csv(liberacoes, 'liberacoes', clean_json=True)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'liberacoes': {str(e)}")
 
