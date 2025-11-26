@@ -633,10 +633,21 @@ Frete = Custo de envio (quando pago pelo vendedor)
 | `DEVOLUCAO` | 1.2.1 Devoluções e Cancelamentos | Despesa (-) |
 | `TRANSFERENCIA` | Transferências | Neutro |
 | `PAGAMENTO_CONTA` | 2.1.1 Compra de Mercadorias | Despesa (-) |
+| `MARKETING_ML` | 2.7.3 Marketing em Marketplace | Despesa (-) |
 | `ESTORNO_FRETE` | 1.3.7 Estorno de Frete sobre Vendas | Receita (+) |
 | `ESTORNO_TAXA` | 1.3.4 Descontos e Estornos de Taxas e Tarifas | Receita (+) |
 | `DIFAL` | 2.2.3 DIFAL (Diferencial de Alíquota) | Despesa (-) |
 | `OUTROS` | 2.14.8 Despesas Eventuais | Despesa (-) |
+
+#### Mapeamento de Débitos por Dívida
+
+| Tipo de Débito | Categoria | Observação |
+|----------------|-----------|------------|
+| "Faturas vencidas" | 2.7.3 Marketing em Marketplace | Product ADS |
+| "Reclamações" | 1.2.1 Devoluções e Cancelamentos | Débito por reclamação ML |
+| "Envio" | 2.9.4 MercadoEnvios | Débito de envio |
+| "Troca" | 1.2.1 Devoluções e Cancelamentos | Débito por troca de produto |
+| "Retido" | 1.2.1 Devoluções e Cancelamentos | Dinheiro retido por disputa |
 
 ---
 

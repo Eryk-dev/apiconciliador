@@ -74,6 +74,7 @@ CA_CATS = {
     'FRETE_REVERSO': "2.9.10 Logística Reversa",
     'DIFAL': "2.2.3 DIFAL (Diferencial de Alíquota)",
     'PAGAMENTO_CONTA': "2.1.1 Compra de Mercadorias",
+    'MARKETING_ML': "2.7.3 Marketing em Marketplace",
     'OUTROS': "2.14.8 Despesas Eventuais",
 
     # NEUTRO
@@ -1014,8 +1015,8 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                     categoria = CA_CATS['DEVOLUCAO']
                     obs = "Débito por troca de produto"
                 elif 'fatura' in tipo_lower:
-                    categoria = CA_CATS['PAGAMENTO_CONTA']
-                    obs = "Faturas vencidas ML"
+                    categoria = CA_CATS['MARKETING_ML']
+                    obs = "Product ADS"
                 elif 'retido' in tipo_lower:
                     categoria = CA_CATS['DEVOLUCAO']
                     obs = "Dinheiro retido por disputa"
