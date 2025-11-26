@@ -1,5 +1,12 @@
 """
-API do Super Conciliador - Mercado Livre -> Conta Azul
+API do Super Conciliador V2 - Mercado Livre -> Conta Azul
+
+VERSÃO MELHORADA com:
+- Cruzamento de dados baseado no EXTRATO como fonte da verdade
+- Detalhamento correto de receita, comissão e frete usando LIBERAÇÕES
+- Validação cruzada dos valores
+- Logging de transações não classificadas
+- Tratamento correto de devoluções e chargebacks
 
 Endpoint:
     POST /conciliar - Recebe os relatórios CSV e retorna um ZIP com os arquivos processados
@@ -11,6 +18,13 @@ Arquivos esperados (form-data):
     - liberacoes: reserve-release report (obrigatório)
     - extrato: account_statement report (obrigatório)
     - retirada: withdraw report (opcional)
+
+Fluxo de Cruzamento:
+    1. EXTRATO é a fonte da verdade (movimentações reais na conta)
+    2. LIBERAÇÕES detalha cada liberação (receita, taxas, frete)
+    3. VENDAS enriquece com dados do pedido (produto, origem)
+    4. DINHEIRO EM CONTA preenche previsões (ainda não liberadas)
+    5. PÓS-VENDA adiciona contexto de devoluções
 """
 
 import pandas as pd
@@ -21,22 +35,53 @@ import io
 import zipfile
 import tempfile
 import shutil
+import logging
 from datetime import datetime
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI(
-    title="Super Conciliador API",
-    description="API para conciliação de relatórios Mercado Livre com Conta Azul",
-    version="1.0.0"
+    title="Super Conciliador API V2",
+    description="API para conciliação de relatórios Mercado Livre com Conta Azul - Versão Melhorada",
+    version="2.0.0"
 )
 
 
 # ==============================================================================
-# FUNÇÕES DE PROCESSAMENTO (Adaptadas do CONCILIADOR_V3.PY)
+# CONSTANTES E CONFIGURAÇÃO
+# ==============================================================================
+
+# Plano de Contas (Conta Azul)
+CA_CATS = {
+    # RECEITAS (valores positivos)
+    'RECEITA_ML': "1.1.1 MercadoLibre",
+    'RECEITA_LOJA': "1.1.2 Loja Própria (E-commerce)",
+    'RECEITA_BALCAO': "1.1.5 Vendas Diretas/Balcão",
+    'ESTORNO_TAXA': "1.3.4 Descontos e Estornos de Taxas e Tarifas",
+    'ESTORNO_FRETE': "1.3.7 Estorno de Frete sobre Vendas",
+
+    # DESPESAS (valores negativos)
+    'DEVOLUCAO': "1.2.1 Devoluções e Cancelamentos",
+    'COMISSAO': "2.8.2 Comissões de Marketplace",
+    'FRETE_ENVIO': "2.9.4 MercadoEnvios",
+    'FRETE_REVERSO': "2.9.10 Logística Reversa",
+    'DIFAL': "2.2.3 DIFAL (Diferencial de Alíquota)",
+    'PAGAMENTO_CONTA': "2.1.1 Compra de Mercadorias",
+    'OUTROS': "2.14.8 Despesas Eventuais",
+
+    # NEUTRO
+    'TRANSFERENCIA': "Transferências",
+}
+
+# ==============================================================================
+# FUNÇÕES UTILITÁRIAS
 # ==============================================================================
 
 def clean_id(val) -> str:
@@ -48,14 +93,55 @@ def clean_id(val) -> str:
 
 def clean_float_extrato(val) -> float:
     """Converte valor do extrato (formato brasileiro) para float"""
+    if pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
     if isinstance(val, str):
         val = val.replace('.', '').replace(',', '.')
-    return float(val)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def safe_float(val, default: float = 0.0) -> float:
+    """Converte valor para float de forma segura"""
+    if pd.isna(val):
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def format_date(val) -> str:
+    """Formata data para dd/mm/yyyy"""
+    if pd.isna(val):
+        return ""
+    try:
+        if isinstance(val, str):
+            # Tenta parsear diferentes formatos
+            for fmt in ['%Y-%m-%d', '%d/%m/%Y', '%Y-%m-%d %H:%M:%S']:
+                try:
+                    return pd.to_datetime(val).strftime('%d/%m/%Y')
+                except:
+                    continue
+        return pd.to_datetime(val).strftime('%d/%m/%Y')
+    except:
+        return ""
 
 
 def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str = "NETAIR") -> Dict[str, Any]:
     """
     Processa a conciliação dos relatórios do Mercado Livre.
+
+    NOVA LÓGICA V2:
+    1. EXTRATO é a fonte da verdade (o que realmente movimentou)
+    2. Para cada movimento do EXTRATO, busca detalhes no LIBERAÇÕES
+    3. LIBERAÇÕES tem o breakdown: receita, comissão, frete
+    4. VENDAS enriquece com dados do pedido
+    5. DINHEIRO EM CONTA é usado apenas para PREVISÕES (não liberados ainda)
 
     Args:
         arquivos: Dicionário com DataFrames dos relatórios
@@ -71,108 +157,36 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
     liberacoes = arquivos['liberacoes']
     extrato = arquivos['extrato']
 
-    # ==============================================================================
-    # LIMPEZA E INTELIGÊNCIA
-    # ==============================================================================
-
-    # Normalizar IDs
-    dinheiro['op_id'] = dinheiro['SOURCE_ID'].apply(clean_id)
-    vendas['op_id'] = vendas['Número da transação do Mercado Pago (operation_id)'].apply(clean_id)
-    pos_venda['op_id'] = pos_venda['ID da transação (operation_id)'].apply(clean_id)
-
-    # Mapas de descrições e valores reais
-    map_desc_vendas = vendas.set_index('op_id')['Descrição da operação (reason)'].to_dict()
-    map_desc_pos_venda = pos_venda.set_index('op_id')['Motivo detalhado (reason_detail)'].to_dict()
-
-    # Mapas de Valores Reais (Vendas)
-    map_valor_produto = vendas.set_index('op_id')['Valor do produto (transaction_amount)'].to_dict()
-    map_custo_envio_real = vendas.set_index('op_id')['Frete (shipping_cost)'].to_dict()
-    map_status_envio = vendas.set_index('op_id')['Status do envio (shipment_status)'].to_dict()
-    map_data_venda = vendas.set_index('op_id')['Data da compra (date_created)'].to_dict()
-    map_data_liberacao_vendas = vendas.set_index('op_id')['Data de liberação do dinheiro (date_released)'].to_dict()
-
-    # Mapa de Comissões (Tarifas) do Relatório Financeiro
-    map_taxa_comissao = {}
-    df_vendas_fin = dinheiro[dinheiro['TRANSACTION_TYPE'] == 'SETTLEMENT']
-    for _, row in df_vendas_fin.iterrows():
-        op_id = row['op_id']
-        fee_total = float(row.get('FEE_AMOUNT', 0.0))
-        shipping_fee = float(row.get('SHIPPING_FEE_AMOUNT', 0.0))
-        pure_commission = fee_total - shipping_fee
-        map_taxa_comissao[op_id] = pure_commission
-
-    # Mapa de datas de cancelamento
-    map_cancelamentos = {}
-    df_cancelamentos = dinheiro[dinheiro['TRANSACTION_TYPE'].isin(['CHARGEBACK', 'REFUND', 'CANCELLATION', 'DISPUTE'])]
-
-    for _, row in df_cancelamentos.iterrows():
-        op_id = row['op_id']
-        data_cancel = pd.to_datetime(row['TRANSACTION_DATE'])
-        if op_id not in map_cancelamentos:
-            map_cancelamentos[op_id] = data_cancel
-
-    # Processar liberações
-    if 'RECORD_TYPE' in liberacoes.columns:
-        liberacoes = liberacoes[liberacoes['RECORD_TYPE'] != 'available_balance'].copy()
-    elif 'SOURCE_ID' in liberacoes.columns:
-        liberacoes = liberacoes[liberacoes['SOURCE_ID'].notna() & (liberacoes['SOURCE_ID'] != '')].copy()
-
-    # Mapas de datas reais de liberação
-    map_real_release_dates = {}
-    liberacoes_por_opid = {}
-
-    if 'SOURCE_ID' in liberacoes.columns and 'DATE' in liberacoes.columns:
-        for _, row in liberacoes.iterrows():
-            try:
-                op_id = clean_id(row['SOURCE_ID'])
-                if op_id:
-                    data_real = pd.to_datetime(row['DATE'])
-                    desc = str(row.get('DESCRIPTION', '')).lower()
-
-                    if desc == 'payment' and op_id not in map_real_release_dates:
-                        map_real_release_dates[op_id] = data_real
-
-                    if op_id not in liberacoes_por_opid:
-                        liberacoes_por_opid[op_id] = []
-                    liberacoes_por_opid[op_id].append({
-                        'date': data_real,
-                        'description': desc,
-                        'credit': float(row.get('NET_CREDIT_AMOUNT', 0)),
-                        'debit': float(row.get('NET_DEBIT_AMOUNT', 0))
-                    })
-            except:
-                continue
-
-    # ==============================================================================
-    # CONFIGURAÇÃO DO PLANO DE CONTAS (CONTA AZUL)
-    # ==============================================================================
-    CA_CATS = {
-        'RECEITA_ML': "1.1.1 MercadoLibre",
-        'RECEITA_LOJA': "1.1.2 Loja Própria (E-commerce)",
-        'RECEITA_BALCAO': "1.1.5 Vendas Diretas/Balcão",
-        'COMISSAO': "2.8.2 Comissões de Marketplace",
-        'FRETE_ENVIO': "2.9.4 MercadoEnvios",
-        'FRETE_REVERSO': "2.9.10 Logística Reversa",
-        'DEVOLUCAO': "1.2.1 Devoluções e Cancelamentos",
-        'TRANSFERENCIA': "Transferências",
-        'PAGAMENTO_CONTA': "2.1.1 Compra de Mercadorias",
-        'ESTORNO_FRETE': "1.3.7 Estorno de Frete sobre Vendas",
-        'ESTORNO_TAXA': "1.3.4 Descontos e Estornos de Taxas e Tarifas",
-        'DIFAL': "2.2.3 DIFAL (Diferencial de Alíquota)",
-        'OUTROS': "2.14.8 Despesas Eventuais"
-    }
     CENTRO_CUSTO = centro_custo
 
-    # Mapa de origem da venda
+    # ==============================================================================
+    # FASE 1: PREPARAÇÃO E INDEXAÇÃO DOS DADOS
+    # ==============================================================================
+
+    logger.info("Fase 1: Preparando e indexando dados...")
+
+    # 1.1 Normalizar IDs em todos os DataFrames
+    if 'SOURCE_ID' in dinheiro.columns:
+        dinheiro['op_id'] = dinheiro['SOURCE_ID'].apply(clean_id)
+
+    if 'Número da transação do Mercado Pago (operation_id)' in vendas.columns:
+        vendas['op_id'] = vendas['Número da transação do Mercado Pago (operation_id)'].apply(clean_id)
+
+    if 'ID da transação (operation_id)' in pos_venda.columns:
+        pos_venda['op_id'] = pos_venda['ID da transação (operation_id)'].apply(clean_id)
+
+    # 1.2 Criar mapa de ORIGEM da venda (ML, LOJA, BALCÃO)
     map_origem_venda = {}
 
+    # Primeiro: se tem order_id do ML, é venda ML
     if 'Número da venda no Mercado Livre (order_id)' in vendas.columns:
         for _, row in vendas.iterrows():
             op_id = clean_id(row.get('Número da transação do Mercado Pago (operation_id)', ''))
             order_id = row.get('Número da venda no Mercado Livre (order_id)', '')
-            if op_id and pd.notna(order_id) and str(order_id).strip() != '':
+            if op_id and pd.notna(order_id) and str(order_id).strip() not in ['', 'nan']:
                 map_origem_venda[op_id] = 'ML'
 
+    # Segundo: verifica SUB_UNIT no dinheiro
     if 'SUB_UNIT' in dinheiro.columns:
         for _, row in dinheiro.iterrows():
             op_id = clean_id(row.get('SOURCE_ID', ''))
@@ -183,7 +197,8 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                 else:
                     map_origem_venda[op_id] = 'LOJA'
 
-    def get_categoria_receita(op_id):
+    def get_categoria_receita(op_id: str) -> str:
+        """Retorna a categoria de receita baseada na origem da venda"""
         origem = map_origem_venda.get(op_id, 'LOJA')
         if origem == 'ML':
             return CA_CATS['RECEITA_ML']
@@ -192,113 +207,598 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
         else:
             return CA_CATS['RECEITA_LOJA']
 
+    # 1.3 Criar mapas de dados das VENDAS para enriquecimento
+    map_vendas = {}
+    for _, row in vendas.iterrows():
+        op_id = row.get('op_id', '')
+        if op_id:
+            map_vendas[op_id] = {
+                'valor_produto': safe_float(row.get('Valor do produto (transaction_amount)', 0)),
+                'frete_comprador': safe_float(row.get('Frete (shipping_cost)', 0)),
+                'descricao': str(row.get('Descrição da operação (reason)', '')),
+                'order_id': clean_id(row.get('Número da venda no Mercado Livre (order_id)', '')),
+                'data_venda': row.get('Data da compra (date_created)', ''),
+                'data_liberacao': row.get('Data de liberação do dinheiro (date_released)', ''),
+                'status_envio': str(row.get('Status do envio (shipment_status)', '')),
+            }
+
+    # 1.4 Criar mapa do PÓS-VENDA para contexto de devoluções
+    map_pos_venda = {}
+    for _, row in pos_venda.iterrows():
+        op_id = row.get('op_id', '')
+        if op_id:
+            map_pos_venda[op_id] = {
+                'motivo': str(row.get('Motivo detalhado (reason_detail)', '')),
+            }
+
     # ==============================================================================
-    # PROCESSAMENTO UNIFICADO
+    # FASE 2: INDEXAR LIBERAÇÕES POR SOURCE_ID E DESCRIPTION
     # ==============================================================================
+
+    logger.info("Fase 2: Indexando liberações...")
+
+    # Filtrar liberações válidas
+    if 'RECORD_TYPE' in liberacoes.columns:
+        liberacoes_filtrado = liberacoes[liberacoes['RECORD_TYPE'] != 'available_balance'].copy()
+    elif 'SOURCE_ID' in liberacoes.columns:
+        liberacoes_filtrado = liberacoes[liberacoes['SOURCE_ID'].notna()].copy()
+    else:
+        liberacoes_filtrado = liberacoes.copy()
+
+    # Mapa de liberações por (SOURCE_ID, DESCRIPTION)
+    # Estrutura: {op_id: {'payment': {...}, 'refund': [{...}, {...}], ...}}
+    map_liberacoes = {}
+
+    for _, row in liberacoes_filtrado.iterrows():
+        op_id = clean_id(row.get('SOURCE_ID', ''))
+        if not op_id:
+            continue
+
+        desc = str(row.get('DESCRIPTION', '')).lower().strip()
+
+        # Extrair valores do LIBERAÇÕES
+        dados = {
+            'date': row.get('DATE', ''),
+            'gross_amount': safe_float(row.get('GROSS_AMOUNT', 0)),
+            'mp_fee': safe_float(row.get('MP_FEE_AMOUNT', 0)),
+            'financing_fee': safe_float(row.get('FINANCING_FEE_AMOUNT', 0)),
+            'shipping_fee': safe_float(row.get('SHIPPING_FEE_AMOUNT', 0)),
+            'net_credit': safe_float(row.get('NET_CREDIT_AMOUNT', 0)),
+            'net_debit': safe_float(row.get('NET_DEBIT_AMOUNT', 0)),
+        }
+
+        # Calcular valor líquido
+        dados['net_amount'] = dados['net_credit'] - dados['net_debit']
+
+        # Calcular comissão total (MP + parcelamento)
+        dados['comissao_total'] = dados['mp_fee'] + dados['financing_fee']
+
+        if op_id not in map_liberacoes:
+            map_liberacoes[op_id] = {}
+
+        # Armazenar por tipo de descrição
+        # Alguns tipos podem ter múltiplos registros para o mesmo ID
+        if desc in ['refund', 'chargeback', 'mediation', 'reserve_for_dispute']:
+            if desc not in map_liberacoes[op_id]:
+                map_liberacoes[op_id][desc] = []
+            map_liberacoes[op_id][desc].append(dados)
+        else:
+            # Payment geralmente é único
+            map_liberacoes[op_id][desc] = dados
+
+    # ==============================================================================
+    # FASE 3: IDENTIFICAR TRANSAÇÕES JÁ LIBERADAS (via LIBERAÇÕES)
+    # ==============================================================================
+
+    # IDs que já aparecem no LIBERAÇÕES = já foram processados
+    ids_liberados = set(map_liberacoes.keys())
+    logger.info(f"Total de IDs com liberação: {len(ids_liberados)}")
+
+    # ==============================================================================
+    # FASE 4: PROCESSAR EXTRATO (FONTE DA VERDADE)
+    # ==============================================================================
+
+    logger.info("Fase 4: Processando EXTRATO...")
+
     rows_conta_azul_confirmados = []
     rows_conta_azul_previsao = []
     rows_pagamento_conta = []
     rows_transferencias = []
+    rows_nao_classificados = []  # Para rastreabilidade
 
     # Preparar EXTRATO
     extrato['Valor'] = extrato['TRANSACTION_NET_AMOUNT'].apply(clean_float_extrato)
-    extrato['Data'] = pd.to_datetime(extrato['RELEASE_DATE'], dayfirst=True)
+    extrato['Data'] = pd.to_datetime(extrato['RELEASE_DATE'], dayfirst=True, errors='coerce')
     extrato['DataStr'] = extrato['Data'].dt.strftime('%d/%m/%Y')
-    extrato['ID'] = extrato['REFERENCE_ID'].astype(str).str.replace('.0', '').str.strip()
+    extrato['ID'] = extrato['REFERENCE_ID'].astype(str).str.replace('.0', '', regex=False).str.strip()
 
-    # Criar mapa de detalhamento do LIBERAÇÕES
-    if 'RECORD_TYPE' in liberacoes.columns:
-        df_releases = liberacoes[liberacoes['RECORD_TYPE'] == 'release'].copy()
-    else:
-        df_releases = liberacoes.copy()
+    def criar_lancamento(op_id: str, data_str: str, categoria: str, valor: float,
+                         descricao: str, observacoes: str, centro: str = CENTRO_CUSTO) -> Dict:
+        """Helper para criar lançamento padronizado"""
+        return {
+            'ID Operação': op_id,
+            'Data de Competência': data_str,
+            'Data de Pagamento': data_str,
+            'Categoria': categoria,
+            'Valor': round(valor, 2),
+            'Centro de Custo': centro,
+            'Descrição': descricao,
+            'Observações': observacoes
+        }
 
-    # Mapa de proporções para payments
-    map_proporcoes = {}
-    for _, row in df_releases.iterrows():
-        try:
-            op_id = clean_id(row['SOURCE_ID'])
-            desc_type = str(row.get('DESCRIPTION', '')).lower()
-            if desc_type == 'payment' and op_id:
-                val_liquido = float(row.get('NET_CREDIT_AMOUNT', 0.0)) - float(row.get('NET_DEBIT_AMOUNT', 0.0))
-                val_mp_fee = float(row.get('MP_FEE_AMOUNT', 0.0))
-                val_financing_fee = float(row.get('FINANCING_FEE_AMOUNT', 0.0)) if 'FINANCING_FEE_AMOUNT' in row.index else 0.0
-                val_comissao = val_mp_fee + val_financing_fee
+    def buscar_liberacao_por_tipo_e_valor(op_id: str, tipo_extrato: str, valor_extrato: float) -> Optional[Dict]:
+        """
+        Busca o registro correto no LIBERAÇÕES baseado no tipo de transação do extrato e valor.
 
-                val_shipping_lib = float(row.get('SHIPPING_FEE_AMOUNT', 0.0)) if 'SHIPPING_FEE_AMOUNT' in row.index else 0.0
+        MAPEAMENTO EXTRATO -> LIBERAÇÕES:
+        - "Liberação de dinheiro" -> payment
+        - "Débito por dívida Reclamações..." -> mediation
+        - "Reembolso..." -> refund
+        - "Dinheiro retido..." -> reserve_for_dispute
+        """
+        if op_id not in map_liberacoes:
+            return None
 
-                if op_id in map_custo_envio_real:
-                    val_frete_vendedor = float(map_custo_envio_real[op_id])
-                    val_gross = float(row.get('GROSS_AMOUNT', 0.0))
-                    val_net = float(row.get('NET_CREDIT_AMOUNT', 0.0)) - float(row.get('NET_DEBIT_AMOUNT', 0.0))
-                    val_mp_fee_lib = float(row.get('MP_FEE_AMOUNT', 0.0))
+        tipo_lower = tipo_extrato.lower()
+        lib_data = map_liberacoes[op_id]
 
-                    if val_frete_vendedor > 0:
-                        val_frete_vendedor = 0.0
-                    elif val_frete_vendedor < 0:
-                        if abs(val_gross - val_net) < 0.10 and abs(val_mp_fee_lib) < 0.10:
-                            val_frete_vendedor = 0.0
-                else:
-                    val_gross = float(row.get('GROSS_AMOUNT', 0.0))
-                    val_net = float(row.get('NET_CREDIT_AMOUNT', 0.0)) - float(row.get('NET_DEBIT_AMOUNT', 0.0))
-                    val_mp_fee = float(row.get('MP_FEE_AMOUNT', 0.0))
-                    val_fin_fee = float(row.get('FINANCING_FEE_AMOUNT', 0.0))
+        # Determinar qual DESCRIPTION buscar
+        if 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower:
+            target_desc = 'payment'
+        elif 'débito por dívida' in tipo_lower or 'debito por divida' in tipo_lower:
+            target_desc = 'mediation'
+        elif 'reembolso' in tipo_lower:
+            target_desc = 'refund'
+        elif 'dinheiro retido' in tipo_lower:
+            target_desc = 'reserve_for_dispute'
+        else:
+            return None
 
-                    soma_sem_frete = val_gross + val_mp_fee + val_fin_fee
-                    if abs(soma_sem_frete - val_net) < 0.10:
-                        val_frete_vendedor = 0.0
+        # Buscar o registro
+        if target_desc in lib_data:
+            dados = lib_data[target_desc]
+            # Se for lista, buscar pelo valor
+            if isinstance(dados, list):
+                for item in dados:
+                    if abs(item['net_amount'] - valor_extrato) < 0.10:
+                        return item
+                # Se não achou por valor exato, retorna o primeiro
+                return dados[0] if dados else None
+            else:
+                # É um dict único
+                return dados
+
+        return None
+
+    def detalhar_liberacao_payment(op_id: str, data_str: str, valor_extrato: float,
+                                   descricao_base: str) -> List[Dict]:
+        """
+        Detalha uma liberação de pagamento usando dados do LIBERAÇÕES.
+
+        LÓGICA CORRETA:
+        - GROSS_AMOUNT = valor bruto (inclui frete do comprador)
+        - SHIPPING_FEE_AMOUNT = frete (negativo = despesa do vendedor OU repasse do frete do comprador)
+        - MP_FEE_AMOUNT = taxa do Mercado Pago (negativo = despesa)
+        - FINANCING_FEE_AMOUNT = taxa de parcelamento (negativo = despesa)
+        - NET_CREDIT - NET_DEBIT = valor líquido (deve bater com extrato)
+
+        IMPORTANTE SOBRE FRETE:
+        - O GROSS_AMOUNT inclui o frete pago pelo comprador
+        - O SHIPPING_FEE_AMOUNT é NEGATIVO e representa o repasse desse frete ao ML
+        - Para a RECEITA, usamos: GROSS_AMOUNT + SHIPPING_FEE (desconta o frete do comprador)
+        - Isso faz a receita bater com o valor do produto mostrado no painel do ML
+
+        IMPORTANTE: Um mesmo ID pode ter múltiplas entradas no LIBERAÇÕES
+        (payment + refund parcial). Precisamos somar tudo para que bata com o extrato.
+        """
+        lancamentos = []
+
+        # Buscar dados no mapa de liberações
+        if op_id in map_liberacoes and 'payment' in map_liberacoes[op_id]:
+            lib = map_liberacoes[op_id]['payment']
+
+            # Valores do LIBERAÇÕES (payment)
+            gross = lib['gross_amount']
+            comissao = lib['comissao_total']  # MP + financing (já negativos)
+            frete_lib = lib['shipping_fee']  # Negativo no LIBERAÇÕES
+            liquido_calculado = lib['net_amount']
+
+            # Verificar quem pagou o frete consultando VENDAS
+            # VENDAS.Frete < 0  → VENDEDOR paga frete (despesa real)
+            # VENDAS.Frete = 0  → COMPRADOR pagou (frete embutido no GROSS, é só repasse)
+            frete_vendas = 0.0
+            valor_produto = gross  # Default: usar GROSS
+            if op_id in map_vendas:
+                frete_vendas = map_vendas[op_id].get('frete_comprador', 0.0)
+                valor_produto = map_vendas[op_id].get('valor_produto', gross)
+
+            # Determinar se é frete do vendedor ou do comprador
+            vendedor_paga_frete = frete_vendas < -0.01  # Negativo em VENDAS = vendedor paga
+
+            if vendedor_paga_frete:
+                # VENDEDOR paga frete: Receita = GROSS, Frete = despesa separada
+                receita = gross
+                frete_despesa = frete_lib  # Negativo, é despesa
+            else:
+                # COMPRADOR pagou frete: Receita = valor do produto (sem frete embutido)
+                # O frete entra no GROSS e sai no SHIPPING_FEE, é só repasse
+                receita = gross + frete_lib  # gross + (frete negativo) = valor produto
+                frete_despesa = 0.0  # Não lançar frete como despesa (é repasse)
+
+            # Verificar se há refund parcial associado
+            refund_gross = 0.0
+            refund_estorno_taxa = 0.0
+            refund_estorno_frete = 0.0
+
+            if 'refund' in map_liberacoes[op_id]:
+                refunds = map_liberacoes[op_id]['refund']
+                for ref in refunds:
+                    refund_gross += ref['gross_amount']  # Negativo = devolvido
+                    refund_estorno_taxa += ref['mp_fee'] + ref['financing_fee']  # Positivo = estornado
+                    refund_estorno_frete += ref['shipping_fee']  # Positivo = estornado
+                    liquido_calculado += ref['net_amount']
+
+            # Validação: o líquido calculado deve bater com o extrato
+            diferenca = abs(liquido_calculado - valor_extrato)
+            if diferenca > 0.10:
+                logger.warning(f"DISCREPÂNCIA op_id={op_id}: extrato={valor_extrato}, calculado={liquido_calculado}, diff={diferenca}")
+
+            # LANÇAMENTO 1: Receita
+            if abs(receita) > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    get_categoria_receita(op_id),
+                    abs(receita),  # Receita sempre positiva
+                    descricao_base,
+                    "Receita de venda"
+                ))
+
+            # LANÇAMENTO 2: Comissão (sempre negativa)
+            if abs(comissao) > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['COMISSAO'],
+                    -abs(comissao),  # Despesa sempre negativa
+                    descricao_base,
+                    f"Tarifa ML (MP: {lib['mp_fee']:.2f} + Parc: {lib['financing_fee']:.2f})"
+                ))
+
+            # LANÇAMENTO 3: Frete (somente se VENDEDOR paga)
+            if abs(frete_despesa) > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['FRETE_ENVIO'],
+                    -abs(frete_despesa),  # Despesa sempre negativa
+                    descricao_base,
+                    "Frete de envio (MercadoEnvios)"
+                ))
+
+            # LANÇAMENTO 4: Refund parcial (se houver)
+            if abs(refund_gross) > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['DEVOLUCAO'],
+                    refund_gross,  # Já é negativo
+                    descricao_base,
+                    "Devolução parcial"
+                ))
+
+            # LANÇAMENTO 5: Estorno de taxa (se houve refund)
+            if refund_estorno_taxa > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['ESTORNO_TAXA'],
+                    refund_estorno_taxa,
+                    descricao_base,
+                    "Estorno de taxa (devolução parcial)"
+                ))
+
+            # LANÇAMENTO 6: Estorno de frete (se houve refund)
+            if refund_estorno_frete > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['ESTORNO_FRETE'],
+                    refund_estorno_frete,
+                    descricao_base,
+                    "Estorno de frete (devolução parcial)"
+                ))
+
+        else:
+            # Fallback: não tem detalhes no LIBERAÇÕES
+            # Tenta usar dados do DINHEIRO EM CONTA
+            logger.info(f"op_id={op_id} sem detalhes em LIBERAÇÕES, usando fallback")
+
+            if op_id in map_vendas:
+                venda = map_vendas[op_id]
+                receita = venda['valor_produto']
+                if receita > 0:
+                    # Calcula comissão por diferença
+                    comissao = receita - valor_extrato
+                    if comissao > 0:
+                        lancamentos.append(criar_lancamento(
+                            op_id, data_str,
+                            get_categoria_receita(op_id),
+                            receita,
+                            descricao_base,
+                            "Receita de venda (estimada)"
+                        ))
+                        lancamentos.append(criar_lancamento(
+                            op_id, data_str,
+                            CA_CATS['COMISSAO'],
+                            -comissao,
+                            descricao_base,
+                            "Tarifa ML (calculada por diferença)"
+                        ))
                     else:
-                        val_frete_vendedor = val_shipping_lib
+                        # Não conseguiu calcular, usa valor total
+                        lancamentos.append(criar_lancamento(
+                            op_id, data_str,
+                            get_categoria_receita(op_id),
+                            valor_extrato,
+                            descricao_base,
+                            "Liberação de venda (sem detalhamento)"
+                        ))
+            else:
+                # Último fallback: valor total como receita
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    get_categoria_receita(op_id),
+                    valor_extrato,
+                    descricao_base,
+                    "Liberação de venda (sem detalhamento)"
+                ))
 
-                val_financing = float(row.get('FINANCING_FEE_AMOUNT', 0.0))
+        return lancamentos
 
-                if op_id in map_valor_produto:
-                    val_receita_real = float(map_valor_produto[op_id])
+    def detalhar_refund(op_id: str, data_str: str, valor_extrato: float,
+                        descricao_base: str) -> List[Dict]:
+        """
+        Detalha um reembolso usando dados do LIBERAÇÕES.
+
+        Em um refund:
+        - GROSS_AMOUNT negativo = valor devolvido ao comprador
+        - MP_FEE positivo = estorno da taxa (volta pro vendedor)
+        - FINANCING_FEE positivo = estorno da taxa de parcelamento
+        - SHIPPING_FEE positivo = estorno do frete
+        """
+        lancamentos = []
+
+        if op_id in map_liberacoes and 'refund' in map_liberacoes[op_id]:
+            refunds = map_liberacoes[op_id]['refund']
+            # Pega o primeiro refund (ou soma se houver múltiplos)
+            ref = refunds[0] if len(refunds) == 1 else refunds[0]  # TODO: somar múltiplos
+
+            valor_devolvido = ref['gross_amount']  # Negativo
+            estorno_mp_fee = ref['mp_fee']  # Positivo se estornado
+            estorno_financing = ref['financing_fee']  # Positivo se estornado
+            estorno_frete = ref['shipping_fee']  # Positivo se estornado
+
+            # LANÇAMENTO 1: Devolução (valor devolvido ao comprador)
+            if abs(valor_devolvido) > 0.01:
+                # Se GROSS_AMOUNT é negativo, é devolução
+                if valor_devolvido < 0:
+                    lancamentos.append(criar_lancamento(
+                        op_id, data_str,
+                        CA_CATS['DEVOLUCAO'],
+                        valor_devolvido,  # Já é negativo
+                        descricao_base,
+                        "Devolução de produto"
+                    ))
                 else:
-                    val_gross = float(row.get('GROSS_AMOUNT', 0.0))
-                    val_shipping_gross = float(row.get('SHIPPING_FEE_AMOUNT', 0.0))
+                    # Se positivo, é estorno de devolução anterior
+                    lancamentos.append(criar_lancamento(
+                        op_id, data_str,
+                        CA_CATS['ESTORNO_TAXA'],
+                        valor_devolvido,
+                        descricao_base,
+                        "Estorno de devolução"
+                    ))
 
-                    if val_frete_vendedor != 0:
-                        val_receita_real = val_gross + val_financing
-                    else:
-                        val_receita_real = val_gross + val_shipping_gross + val_financing
+            # LANÇAMENTO 2: Estorno de taxa MP (se positivo)
+            if estorno_mp_fee > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['ESTORNO_TAXA'],
+                    estorno_mp_fee,
+                    descricao_base,
+                    "Estorno taxa Mercado Livre"
+                ))
+            elif estorno_mp_fee < -0.01:
+                # Taxa cobrada (raro em refund)
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['COMISSAO'],
+                    estorno_mp_fee,
+                    descricao_base,
+                    "Taxa sobre devolução"
+                ))
 
-                if val_liquido != 0:
-                    map_proporcoes[op_id] = {
-                        'receita': val_receita_real,
-                        'liquido': val_liquido,
-                        'comissao': val_comissao,
-                        'frete': val_frete_vendedor
-                    }
-        except:
-            continue
+            # LANÇAMENTO 3: Estorno de taxa parcelamento
+            if estorno_financing > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['ESTORNO_TAXA'],
+                    estorno_financing,
+                    descricao_base,
+                    "Estorno taxa parcelamento"
+                ))
 
-    # Mapa de detalhamento para refunds
-    map_refunds = {}
-    for _, row in df_releases.iterrows():
-        try:
-            op_id = clean_id(row['SOURCE_ID'])
-            desc_type = str(row.get('DESCRIPTION', '')).lower()
-            if desc_type == 'refund' and op_id:
-                val_liquido = float(row.get('NET_CREDIT_AMOUNT', 0.0)) - float(row.get('NET_DEBIT_AMOUNT', 0.0))
-                val_bruto = float(row.get('GROSS_AMOUNT', 0.0))
-                val_mp_fee = float(row.get('MP_FEE_AMOUNT', 0.0))
-                val_financing_fee = float(row.get('FINANCING_FEE_AMOUNT', 0.0))
-                val_frete = float(row.get('SHIPPING_FEE_AMOUNT', 0.0))
+            # LANÇAMENTO 4: Estorno de frete
+            if estorno_frete > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['ESTORNO_FRETE'],
+                    estorno_frete,
+                    descricao_base,
+                    "Estorno de frete"
+                ))
+            elif estorno_frete < -0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['FRETE_REVERSO'],
+                    estorno_frete,
+                    descricao_base,
+                    "Frete de logística reversa"
+                ))
 
-                if op_id not in map_refunds:
-                    map_refunds[op_id] = []
-                map_refunds[op_id].append({
-                    'bruto': val_bruto,
-                    'liquido': val_liquido,
-                    'mp_fee': val_mp_fee,
-                    'financing_fee': val_financing_fee,
-                    'frete': val_frete
-                })
-        except:
-            continue
+        else:
+            # Fallback: não tem detalhes
+            if valor_extrato > 0:
+                # Positivo = estorno
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['ESTORNO_TAXA'],
+                    valor_extrato,
+                    descricao_base,
+                    "Estorno (sem detalhamento)"
+                ))
+            else:
+                # Negativo = devolução
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['DEVOLUCAO'],
+                    valor_extrato,
+                    descricao_base,
+                    "Reembolso (sem detalhamento)"
+                ))
 
-    # Processar EXTRATO linha por linha
-    for _, row in extrato.iterrows():
+        return lancamentos
+
+    def detalhar_transacao_assertiva(op_id: str, tipo_extrato: str, data_str: str,
+                                     valor_extrato: float, descricao_base: str) -> List[Dict]:
+        """
+        Detalha uma transação de forma assertiva usando o mapeamento correto entre
+        EXTRATO e LIBERAÇÕES.
+
+        Para IDs com múltiplas transações, busca o registro específico no LIBERAÇÕES
+        que corresponde a esta linha do extrato.
+
+        Retorna lista de lançamentos detalhados ou lista vazia se não conseguir detalhar.
+        """
+        lancamentos = []
+        tipo_lower = tipo_extrato.lower()
+
+        # Buscar registro correspondente no LIBERAÇÕES
+        lib = buscar_liberacao_por_tipo_e_valor(op_id, tipo_extrato, valor_extrato)
+
+        if not lib:
+            return []  # Não encontrou, processar de forma simplificada
+
+        # =========================================================================
+        # LIBERAÇÃO DE DINHEIRO (payment) - Detalha receita, comissão, frete
+        # =========================================================================
+        if 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower:
+            gross = lib['gross_amount']
+            comissao = lib['comissao_total']
+            frete_lib = lib['shipping_fee']
+
+            # Verificar quem pagou o frete consultando VENDAS
+            # VENDAS.Frete < 0  → VENDEDOR paga frete (despesa real)
+            # VENDAS.Frete = 0  → COMPRADOR pagou (frete embutido no GROSS, é só repasse)
+            frete_vendas = 0.0
+            if op_id in map_vendas:
+                frete_vendas = map_vendas[op_id].get('frete_comprador', 0.0)
+
+            vendedor_paga_frete = frete_vendas < -0.01
+
+            if vendedor_paga_frete:
+                # VENDEDOR paga frete: Receita = GROSS, Frete = despesa separada
+                receita = gross
+                frete_despesa = frete_lib
+            else:
+                # COMPRADOR pagou frete: Receita = valor do produto (sem frete)
+                receita = gross + frete_lib  # gross + (frete negativo) = valor produto
+                frete_despesa = 0.0
+
+            if abs(receita) > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, get_categoria_receita(op_id),
+                    abs(receita), descricao_base, "Receita de venda"
+                ))
+
+            if abs(comissao) > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['COMISSAO'],
+                    -abs(comissao), descricao_base,
+                    f"Tarifa ML (MP: {lib['mp_fee']:.2f} + Parc: {lib['financing_fee']:.2f})"
+                ))
+
+            # Frete somente se VENDEDOR paga
+            if abs(frete_despesa) > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['FRETE_ENVIO'],
+                    -abs(frete_despesa), descricao_base, "Frete de envio (MercadoEnvios)"
+                ))
+
+        # =========================================================================
+        # DÉBITO POR DÍVIDA / MEDIAÇÃO - Valor negativo direto
+        # =========================================================================
+        elif 'débito por dívida' in tipo_lower or 'debito por divida' in tipo_lower:
+            # mediation: GROSS_AMOUNT é o valor da dívida (negativo)
+            # Não tem detalhamento, é um valor direto
+            lancamentos.append(criar_lancamento(
+                op_id, data_str, CA_CATS['DEVOLUCAO'],
+                valor_extrato, descricao_base, "Débito por reclamação/mediação ML"
+            ))
+
+        # =========================================================================
+        # REEMBOLSO (refund) - Detalha estornos de taxa e frete
+        # =========================================================================
+        elif 'reembolso' in tipo_lower:
+            # refund: MP_FEE e SHIPPING_FEE são positivos = estornados
+            estorno_taxa = lib['mp_fee'] + lib['financing_fee']
+            estorno_frete = lib['shipping_fee']
+
+            # Se gross_amount for negativo, é devolução de valor ao comprador
+            if lib['gross_amount'] < -0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['DEVOLUCAO'],
+                    lib['gross_amount'], descricao_base, "Devolução ao comprador"
+                ))
+
+            # Estorno de taxa (positivo)
+            if estorno_taxa > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['ESTORNO_TAXA'],
+                    estorno_taxa, descricao_base, "Estorno de taxa ML"
+                ))
+
+            # Estorno de frete (positivo)
+            if estorno_frete > 0.01:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['ESTORNO_FRETE'],
+                    estorno_frete, descricao_base, "Estorno de frete"
+                ))
+
+        # =========================================================================
+        # DINHEIRO RETIDO (reserve_for_dispute)
+        # =========================================================================
+        elif 'dinheiro retido' in tipo_lower:
+            if valor_extrato < 0:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['DEVOLUCAO'],
+                    valor_extrato, descricao_base, "Dinheiro retido (bloqueio por disputa)"
+                ))
+            else:
+                lancamentos.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['ESTORNO_TAXA'],
+                    valor_extrato, descricao_base, "Dinheiro liberado (desbloqueio)"
+                ))
+
+        return lancamentos
+
+    # ==============================================================================
+    # FASE 5: PROCESSAR EXTRATO LINHA POR LINHA
+    # ==============================================================================
+
+    logger.info("Fase 5: Processando cada linha do EXTRATO...")
+
+    # Identificar quais IDs têm múltiplas transações no extrato
+    ids_multiplos = extrato.groupby('ID').size()
+    ids_multiplos = set(ids_multiplos[ids_multiplos > 1].index)
+    logger.info(f"IDs com múltiplas transações no extrato: {len(ids_multiplos)}")
+
+    for idx, row in extrato.iterrows():
         try:
             op_id = row['ID']
             tipo_transacao = str(row.get('TRANSACTION_TYPE', ''))
@@ -306,451 +806,408 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             data_str = row['DataStr']
             tipo_lower = tipo_transacao.lower()
 
+            # Ignorar valores zerados
             if abs(val) < 0.01:
                 continue
 
-            final_desc = f"{op_id} - {tipo_transacao[:50]}"
+            descricao_base = f"{op_id} - {tipo_transacao[:50]}"
 
-            # TRANSFERÊNCIAS
+            # =====================================================================
+            # CATEGORIA 1: TRANSFERÊNCIAS (PIX, TED, etc.)
+            # =====================================================================
             if 'ransfer' in tipo_lower:
                 is_pix_recebido = 'pix recebid' in tipo_lower
-                is_interno = 'netparts' in tipo_lower or 'jonathan' in tipo_lower or 'netair' in tipo_lower
+                is_interno = any(x in tipo_lower for x in ['netparts', 'jonathan', 'netair'])
 
                 if is_pix_recebido and not is_interno and val > 0:
-                    rows_conta_azul_confirmados.append({
-                        'ID Operação': op_id,
-                        'Data de Competência': data_str,
-                        'Data de Pagamento': data_str,
-                        'Categoria': get_categoria_receita(op_id),
-                        'Valor': val,
-                        'Centro de Custo': CENTRO_CUSTO,
-                        'Descrição': final_desc,
-                        'Observações': "PIX recebido (venda)"
-                    })
+                    # PIX recebido de cliente = venda
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str,
+                        get_categoria_receita(op_id),
+                        val,
+                        descricao_base,
+                        "PIX recebido (venda externa)"
+                    ))
                 else:
-                    rows_transferencias.append({
-                        'ID Operação': op_id,
-                        'Data de Competência': data_str,
-                        'Data de Pagamento': data_str,
-                        'Categoria': CA_CATS['TRANSFERENCIA'],
-                        'Valor': val,
-                        'Centro de Custo': "",
-                        'Descrição': final_desc,
-                        'Observações': tipo_transacao
-                    })
+                    # Transferência normal
+                    rows_transferencias.append(criar_lancamento(
+                        op_id, data_str,
+                        CA_CATS['TRANSFERENCIA'],
+                        val,
+                        descricao_base,
+                        tipo_transacao,
+                        centro=""
+                    ))
                 continue
 
-            # LIBERAÇÃO DE DINHEIRO CANCELADA
+            # =====================================================================
+            # CATEGORIA 2: LIBERAÇÃO DE DINHEIRO CANCELADA
+            # =====================================================================
             if 'liberação de dinheiro cancelada' in tipo_lower or 'liberacao de dinheiro cancelada' in tipo_lower:
-                categoria_cancel = CA_CATS['ESTORNO_TAXA'] if val > 0 else CA_CATS['DEVOLUCAO']
-                obs_cancel = "Estorno Liberação Cancelada" if val > 0 else "Liberação cancelada"
-                rows_conta_azul_confirmados.append({
-                    'ID Operação': op_id,
-                    'Data de Competência': data_str,
-                    'Data de Pagamento': data_str,
-                    'Categoria': categoria_cancel,
-                    'Valor': val,
-                    'Centro de Custo': CENTRO_CUSTO,
-                    'Descrição': final_desc,
-                    'Observações': obs_cancel
-                })
+                if val > 0:
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str, CA_CATS['ESTORNO_TAXA'], val,
+                        descricao_base, "Estorno de liberação cancelada"
+                    ))
+                else:
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str, CA_CATS['DEVOLUCAO'], val,
+                        descricao_base, "Liberação cancelada (chargeback)"
+                    ))
                 continue
 
-            # PAGAMENTO DE FATURA DO CARTÃO DE CRÉDITO MERCADO PAGO
-            # Deve ir para transferências, não é receita
+            # =====================================================================
+            # CATEGORIA 3: PAGAMENTO FATURA CARTÃO MP (vai para transferências)
+            # =====================================================================
             if 'pagamento' in tipo_lower and 'cartão de crédito' in tipo_lower:
-                rows_transferencias.append({
-                    'ID Operação': op_id,
-                    'Data de Competência': data_str,
-                    'Data de Pagamento': data_str,
-                    'Categoria': CA_CATS['TRANSFERENCIA'],
-                    'Valor': val,
-                    'Centro de Custo': "",
-                    'Descrição': final_desc,
-                    'Observações': "Pagamento fatura cartão MP"
-                })
+                rows_transferencias.append(criar_lancamento(
+                    op_id, data_str,
+                    CA_CATS['TRANSFERENCIA'],
+                    val,
+                    descricao_base,
+                    "Pagamento fatura cartão Mercado Pago",
+                    centro=""
+                ))
                 continue
 
-            # LIBERAÇÃO DE DINHEIRO (ou transação com detalhamento no arquivo de liberações)
-            # Verifica se é liberação OU se tem dados no map_proporcoes (venda com PIX no extrato)
+            # =====================================================================
+            # CATEGORIA 4: LIBERAÇÃO DE DINHEIRO (VENDA)
+            # Esta é a categoria principal - detalha usando LIBERAÇÕES
+            # =====================================================================
             is_liberacao = 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower
-            has_proporcoes = op_id in map_proporcoes
+            has_payment_data = op_id in map_liberacoes and 'payment' in map_liberacoes[op_id]
+            is_id_multiplo = op_id in ids_multiplos
 
-            if is_liberacao or has_proporcoes:
-                if op_id in map_proporcoes:
-                    props = map_proporcoes[op_id]
-                    val_receita = props['receita']
-                    val_frete = props['frete']
-                    val_comissao = val - val_receita - val_frete
-
-                    if abs(val_receita) > 0.01:
-                        rows_conta_azul_confirmados.append({
-                            'ID Operação': op_id,
-                            'Data de Competência': data_str,
-                            'Data de Pagamento': data_str,
-                            'Categoria': get_categoria_receita(op_id),
-                            'Valor': round(val_receita, 2),
-                            'Centro de Custo': CENTRO_CUSTO,
-                            'Descrição': final_desc,
-                            'Observações': "Receita de venda"
-                        })
-
-                    if abs(val_comissao) > 0.01:
-                        cat_comissao = CA_CATS['ESTORNO_TAXA'] if val_comissao > 0 else CA_CATS['COMISSAO']
-                        obs_comissao = "Estorno de Taxa" if val_comissao > 0 else "Tarifa Mercado Livre"
-                        rows_conta_azul_confirmados.append({
-                            'ID Operação': op_id,
-                            'Data de Competência': data_str,
-                            'Data de Pagamento': data_str,
-                            'Categoria': cat_comissao,
-                            'Valor': round(val_comissao, 2),
-                            'Centro de Custo': CENTRO_CUSTO,
-                            'Descrição': final_desc,
-                            'Observações': obs_comissao
-                        })
-
-                    if abs(val_frete) > 0.01:
-                        rows_conta_azul_confirmados.append({
-                            'ID Operação': op_id,
-                            'Data de Competência': data_str,
-                            'Data de Pagamento': data_str,
-                            'Categoria': CA_CATS['FRETE_ENVIO'],
-                            'Valor': round(val_frete, 2),
-                            'Centro de Custo': CENTRO_CUSTO,
-                            'Descrição': final_desc,
-                            'Observações': "Frete de envio"
-                        })
-                else:
-                    rows_conta_azul_confirmados.append({
-                        'ID Operação': op_id,
-                        'Data de Competência': data_str,
-                        'Data de Pagamento': data_str,
-                        'Categoria': get_categoria_receita(op_id),
-                        'Valor': val,
-                        'Centro de Custo': CENTRO_CUSTO,
-                        'Descrição': final_desc,
-                        'Observações': "Liberação de venda"
-                    })
-                continue
-
-            # REEMBOLSO
-            if tipo_transacao.strip().startswith('Reembolso'):
-                if op_id in map_refunds and len(map_refunds[op_id]) > 0:
-                    ref = map_refunds[op_id][0]
-                    val_liquido_ref = ref['liquido']
-
-                    if val_liquido_ref != 0:
-                        prop_bruto = ref['bruto'] / val_liquido_ref if val_liquido_ref != 0 else 0
-                        prop_mp_fee = ref['mp_fee'] / val_liquido_ref if val_liquido_ref != 0 else 0
-                        prop_financing_fee = ref['financing_fee'] / val_liquido_ref if val_liquido_ref != 0 else 0
-                        prop_frete = ref['frete'] / val_liquido_ref if val_liquido_ref != 0 else 0
-
-                        val_bruto = val * prop_bruto
-                        val_mp_fee = val * prop_mp_fee
-                        val_financing_fee = val * prop_financing_fee
-                        val_frete = val * prop_frete
-
-                        if abs(val_bruto) > 0.01:
-                            cat_bruto = CA_CATS['ESTORNO_TAXA'] if val_bruto > 0 else CA_CATS['DEVOLUCAO']
-                            obs_bruto = "Estorno de Devolução (disputa)" if val_bruto > 0 else "Devolução de produto"
-                            rows_conta_azul_confirmados.append({
-                                'ID Operação': op_id,
-                                'Data de Competência': data_str,
-                                'Data de Pagamento': data_str,
-                                'Categoria': cat_bruto,
-                                'Valor': round(val_bruto, 2),
-                                'Centro de Custo': CENTRO_CUSTO,
-                                'Descrição': final_desc,
-                                'Observações': obs_bruto
-                            })
-
-                        if abs(val_mp_fee) > 0.01:
-                            cat_mp_fee = CA_CATS['ESTORNO_TAXA'] if val_mp_fee > 0 else CA_CATS['COMISSAO']
-                            obs_mp_fee = "Estorno Taxa Mercado Livre" if val_mp_fee > 0 else "Taxa Mercado Livre (disputa)"
-                            rows_conta_azul_confirmados.append({
-                                'ID Operação': op_id,
-                                'Data de Competência': data_str,
-                                'Data de Pagamento': data_str,
-                                'Categoria': cat_mp_fee,
-                                'Valor': round(val_mp_fee, 2),
-                                'Centro de Custo': CENTRO_CUSTO,
-                                'Descrição': final_desc,
-                                'Observações': obs_mp_fee
-                            })
-
-                        if abs(val_financing_fee) > 0.01:
-                            cat_fin_fee = CA_CATS['ESTORNO_TAXA'] if val_financing_fee > 0 else CA_CATS['COMISSAO']
-                            obs_fin_fee = "Estorno Taxa Parcelamento" if val_financing_fee > 0 else "Taxa Parcelamento (disputa)"
-                            rows_conta_azul_confirmados.append({
-                                'ID Operação': op_id,
-                                'Data de Competência': data_str,
-                                'Data de Pagamento': data_str,
-                                'Categoria': cat_fin_fee,
-                                'Valor': round(val_financing_fee, 2),
-                                'Centro de Custo': CENTRO_CUSTO,
-                                'Descrição': final_desc,
-                                'Observações': obs_fin_fee
-                            })
-
-                        if abs(val_frete) > 0.01:
-                            cat_frete = CA_CATS['ESTORNO_FRETE'] if val_frete > 0 else CA_CATS['FRETE_ENVIO']
-                            obs_frete = "Estorno de Frete" if val_frete > 0 else "Frete (disputa)"
-                            rows_conta_azul_confirmados.append({
-                                'ID Operação': op_id,
-                                'Data de Competência': data_str,
-                                'Data de Pagamento': data_str,
-                                'Categoria': cat_frete,
-                                'Valor': round(val_frete, 2),
-                                'Centro de Custo': CENTRO_CUSTO,
-                                'Descrição': final_desc,
-                                'Observações': obs_frete
-                            })
+            if is_liberacao and has_payment_data:
+                if is_id_multiplo:
+                    # Para IDs múltiplos, usar detalhamento assertivo
+                    lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_str, val, descricao_base)
+                    if lancamentos:
+                        rows_conta_azul_confirmados.extend(lancamentos)
                     else:
-                        categoria_reemb = CA_CATS['ESTORNO_TAXA'] if val > 0 else CA_CATS['DEVOLUCAO']
-                        obs_reemb = "Estorno de Taxas" if val > 0 else "Reembolso"
-                        rows_conta_azul_confirmados.append({
-                            'ID Operação': op_id,
-                            'Data de Competência': data_str,
-                            'Data de Pagamento': data_str,
-                            'Categoria': categoria_reemb,
-                            'Valor': val,
-                            'Centro de Custo': CENTRO_CUSTO,
-                            'Descrição': final_desc,
-                            'Observações': obs_reemb
-                        })
+                        # Fallback: valor direto
+                        rows_conta_azul_confirmados.append(criar_lancamento(
+                            op_id, data_str, get_categoria_receita(op_id), val,
+                            descricao_base, "Liberação de venda"
+                        ))
                 else:
-                    categoria_reemb = CA_CATS['ESTORNO_TAXA'] if val > 0 else CA_CATS['DEVOLUCAO']
-                    obs_reemb = "Estorno de Taxas" if val > 0 else "Reembolso"
-                    rows_conta_azul_confirmados.append({
-                        'ID Operação': op_id,
-                        'Data de Competência': data_str,
-                        'Data de Pagamento': data_str,
-                        'Categoria': categoria_reemb,
-                        'Valor': val,
-                        'Centro de Custo': CENTRO_CUSTO,
-                        'Descrição': final_desc,
-                        'Observações': obs_reemb
-                    })
+                    # Para IDs únicos, usar detalhamento completo (com refund parcial se houver)
+                    lancamentos = detalhar_liberacao_payment(op_id, data_str, val, descricao_base)
+                    rows_conta_azul_confirmados.extend(lancamentos)
+                continue
+            elif is_liberacao:
+                # Liberação sem dados detalhados - usa valor do extrato
+                rows_conta_azul_confirmados.append(criar_lancamento(
+                    op_id, data_str,
+                    get_categoria_receita(op_id),
+                    val,
+                    descricao_base,
+                    "Liberação de venda"
+                ))
                 continue
 
-            # DINHEIRO RETIDO
+            # =====================================================================
+            # CATEGORIA 5: REEMBOLSO
+            # Detalha usando dados do LIBERAÇÕES
+            # =====================================================================
+            if tipo_transacao.strip().startswith('Reembolso') or 'reembolso' in tipo_lower:
+                if is_id_multiplo:
+                    # Para IDs múltiplos, usar detalhamento assertivo
+                    lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_str, val, descricao_base)
+                    if lancamentos:
+                        rows_conta_azul_confirmados.extend(lancamentos)
+                    else:
+                        # Fallback: valor direto
+                        if val > 0:
+                            rows_conta_azul_confirmados.append(criar_lancamento(
+                                op_id, data_str, CA_CATS['ESTORNO_TAXA'], val,
+                                descricao_base, "Estorno (envío cancelado/devolução)"
+                            ))
+                        else:
+                            rows_conta_azul_confirmados.append(criar_lancamento(
+                                op_id, data_str, CA_CATS['DEVOLUCAO'], val,
+                                descricao_base, "Devolução ao comprador"
+                            ))
+                else:
+                    # Para IDs únicos, detalhar usando LIBERAÇÕES
+                    lancamentos = detalhar_refund(op_id, data_str, val, descricao_base)
+                    rows_conta_azul_confirmados.extend(lancamentos)
+                continue
+
+            # =====================================================================
+            # CATEGORIA 6: DINHEIRO RETIDO (Disputa em andamento)
+            # =====================================================================
             if 'dinheiro retido' in tipo_lower:
-                rows_conta_azul_confirmados.append({
-                    'ID Operação': op_id,
-                    'Data de Competência': data_str,
-                    'Data de Pagamento': data_str,
-                    'Categoria': CA_CATS['DEVOLUCAO'],
-                    'Valor': val,
-                    'Centro de Custo': CENTRO_CUSTO,
-                    'Descrição': final_desc,
-                    'Observações': "Dinheiro retido (disputa)"
-                })
+                # Dinheiro retido = bloqueio temporário por disputa
+                # Valor negativo = bloqueou, valor positivo = desbloqueou
+                if val < 0:
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str, CA_CATS['DEVOLUCAO'], val,
+                        descricao_base, "Dinheiro retido (bloqueio por disputa)"
+                    ))
+                else:
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str, CA_CATS['ESTORNO_TAXA'], val,
+                        descricao_base, "Dinheiro liberado (desbloqueio)"
+                    ))
                 continue
 
-            # OUTRAS CATEGORIAS
-            if 'difal' in tipo_lower:
-                categoria = CA_CATS['DIFAL']
-                obs = "DIFAL"
-            elif 'imposto interestadual' in tipo_lower:
-                categoria = CA_CATS['DIFAL']
-                obs = "Imposto Interestadual"
-            elif 'pagamento de contas' in tipo_lower:
-                categoria = CA_CATS['PAGAMENTO_CONTA']
-                obs = "Pagamento de Conta via MP"
-            elif 'pagamento' in tipo_lower or 'qr' in tipo_lower:
+            # =====================================================================
+            # CATEGORIA 7: OUTRAS TRANSAÇÕES ESPECÍFICAS
+            # =====================================================================
+
+            # DIFAL / Impostos
+            if 'difal' in tipo_lower or 'imposto interestadual' in tipo_lower or 'aliquota' in tipo_lower:
+                rows_conta_azul_confirmados.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['DIFAL'], val,
+                    descricao_base, "DIFAL/Imposto Interestadual"
+                ))
+                continue
+
+            # Pagamento de contas
+            if 'pagamento de contas' in tipo_lower:
+                rows_pagamento_conta.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['PAGAMENTO_CONTA'], val,
+                    descricao_base, "Pagamento de conta via MP"
+                ))
+                continue
+
+            # Pagamento/QR (PIX enviado ou recebido)
+            if 'pagamento' in tipo_lower or 'qr' in tipo_lower:
                 if val < 0:
-                    categoria = CA_CATS['PAGAMENTO_CONTA']
-                    obs = "Pagamento PIX enviado"
+                    rows_pagamento_conta.append(criar_lancamento(
+                        op_id, data_str, CA_CATS['PAGAMENTO_CONTA'], val,
+                        descricao_base, "Pagamento enviado via PIX/QR"
+                    ))
                 else:
-                    categoria = get_categoria_receita(op_id)
-                    obs = "Pagamento PIX recebido"
-            elif 'entrada' in tipo_lower:
-                categoria = get_categoria_receita(op_id)
-                obs = "Entrada de dinheiro"
-            elif 'débito' in tipo_lower or 'divida' in tipo_lower:
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str, get_categoria_receita(op_id), val,
+                        descricao_base, "Pagamento recebido via PIX/QR"
+                    ))
+                continue
+
+            # Entrada de dinheiro
+            if 'entrada' in tipo_lower:
+                rows_conta_azul_confirmados.append(criar_lancamento(
+                    op_id, data_str, get_categoria_receita(op_id), val,
+                    descricao_base, "Entrada de dinheiro"
+                ))
+                continue
+
+            # Débitos diversos
+            if 'débito' in tipo_lower or 'debito' in tipo_lower or 'dívida' in tipo_lower or 'divida' in tipo_lower:
+                # Para IDs múltiplos com reclamação, tentar detalhamento assertivo
+                if is_id_multiplo and 'reclama' in tipo_lower:
+                    lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_str, val, descricao_base)
+                    if lancamentos:
+                        rows_conta_azul_confirmados.extend(lancamentos)
+                        continue
+
+                # Fallback: categorizar pelo tipo
                 if 'reclama' in tipo_lower:
                     categoria = CA_CATS['DEVOLUCAO']
-                    obs = "Débito Reclamação ML"
+                    obs = "Débito por reclamação ML"
                 elif 'envio' in tipo_lower:
                     categoria = CA_CATS['FRETE_ENVIO']
-                    obs = "Débito Envio ML"
-                elif 'aliquota' in tipo_lower or 'difal' in tipo_lower:
-                    categoria = CA_CATS['DIFAL']
-                    obs = "DIFAL via Débito"
-                elif 'imposto' in tipo_lower:
-                    categoria = CA_CATS['DIFAL']
-                    obs = "Imposto Interestadual"
+                    obs = "Débito de envio"
                 elif 'troca' in tipo_lower:
                     categoria = CA_CATS['DEVOLUCAO']
-                    obs = "Débito Troca Produto"
+                    obs = "Débito por troca de produto"
+                elif 'fatura' in tipo_lower:
+                    categoria = CA_CATS['PAGAMENTO_CONTA']
+                    obs = "Faturas vencidas ML"
+                elif 'retido' in tipo_lower:
+                    categoria = CA_CATS['DEVOLUCAO']
+                    obs = "Dinheiro retido por disputa"
                 else:
                     categoria = CA_CATS['OUTROS']
                     obs = "Débito/Dívida ML"
-            elif 'bônus' in tipo_lower or 'bonus' in tipo_lower:
-                categoria = CA_CATS['ESTORNO_FRETE']
-                obs = "Bônus de envio"
-            elif 'compra' in tipo_lower:
-                categoria = CA_CATS['PAGAMENTO_CONTA']
-                obs = "Compra Mercado Livre"
-            elif 'reembolso' in tipo_lower:
-                categoria = CA_CATS['DEVOLUCAO']
-                obs = "Reembolso"
-            else:
-                categoria = CA_CATS['OUTROS']
-                obs = "Outros"
 
-            rows_conta_azul_confirmados.append({
-                'ID Operação': op_id,
-                'Data de Competência': data_str,
-                'Data de Pagamento': data_str,
-                'Categoria': categoria,
-                'Valor': val,
-                'Centro de Custo': CENTRO_CUSTO,
-                'Descrição': final_desc,
-                'Observações': obs
-            })
-
-        except Exception as e:
-            continue
-
-    # ==============================================================================
-    # PROCESSAMENTO DO DINHEIRO EM CONTA (PREVISÕES)
-    # ==============================================================================
-
-    for _, row in dinheiro.iterrows():
-        op_id = row['op_id']
-        tipo_op = row['TRANSACTION_TYPE']
-
-        if op_id in liberacoes_por_opid:
-            continue
-
-        data_origem_obj = pd.to_datetime(row['TRANSACTION_DATE'])
-        if op_id in map_data_venda:
-            data_origem_obj = pd.to_datetime(map_data_venda[op_id], dayfirst=True)
-        data_competencia = data_origem_obj.strftime('%d/%m/%Y')
-
-        try:
-            if pd.notna(row.get('MONEY_RELEASE_DATE')):
-                data_prev = pd.to_datetime(row['MONEY_RELEASE_DATE'])
-                data_caixa = data_prev.strftime('%d/%m/%Y')
-            elif op_id in map_data_liberacao_vendas:
-                data_prev = pd.to_datetime(map_data_liberacao_vendas[op_id], dayfirst=True)
-                data_caixa = data_prev.strftime('%d/%m/%Y')
-            else:
-                data_caixa = ""
-        except:
-            data_caixa = ""
-
-        id_pedido = str(row.get('EXTERNAL_REFERENCE', '')).replace('.0', '').strip()
-        if not id_pedido or id_pedido == 'nan':
-            id_pedido = str(row.get('ORDER_ID', '')).replace('.0', '').strip()
-        desc_part = f"Pedido {id_pedido}" if id_pedido and id_pedido != 'nan' else f"Op {op_id}"
-        final_desc = f"{op_id} - {desc_part}"
-
-        if tipo_op == 'SETTLEMENT':
-            val_receita = float(map_valor_produto.get(op_id, row['TRANSACTION_AMOUNT']))
-            val_frete_real = float(map_custo_envio_real.get(op_id, 0.0))
-            if op_id not in map_valor_produto:
-                val_frete_real = float(row['SHIPPING_FEE_AMOUNT'])
-
-            if val_receita < 0:
-                data_pag_competencia = data_caixa if data_caixa else data_competencia
-                rows_pagamento_conta.append({
-                    'ID Operação': op_id,
-                    'Data de Competência': data_pag_competencia,
-                    'Data de Pagamento': data_caixa,
-                    'Categoria': CA_CATS['PAGAMENTO_CONTA'],
-                    'Valor': val_receita,
-                    'Centro de Custo': CENTRO_CUSTO,
-                    'Descrição': final_desc,
-                    'Observações': f"{op_id} - Pagamento via Mercado Pago"
-                })
+                rows_conta_azul_confirmados.append(criar_lancamento(
+                    op_id, data_str, categoria, val, descricao_base, obs
+                ))
                 continue
 
-            rows_conta_azul_previsao.append({
-                'ID Operação': op_id,
-                'Data de Competência': data_competencia,
-                'Data de Pagamento': data_caixa,
-                'Categoria': get_categoria_receita(op_id),
-                'Valor': val_receita,
-                'Centro de Custo': CENTRO_CUSTO,
-                'Descrição': final_desc,
-                'Observações': "Receita de venda (PREVISÃO)"
+            # Bônus de envio
+            if 'bônus' in tipo_lower or 'bonus' in tipo_lower:
+                rows_conta_azul_confirmados.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['ESTORNO_FRETE'], val,
+                    descricao_base, "Bônus de envio"
+                ))
+                continue
+
+            # Compra no ML
+            if 'compra' in tipo_lower:
+                rows_pagamento_conta.append(criar_lancamento(
+                    op_id, data_str, CA_CATS['PAGAMENTO_CONTA'], val,
+                    descricao_base, "Compra no Mercado Livre"
+                ))
+                continue
+
+            # =====================================================================
+            # CATEGORIA 8: NÃO CLASSIFICADO (para revisão)
+            # =====================================================================
+            rows_nao_classificados.append({
+                'op_id': op_id,
+                'tipo': tipo_transacao,
+                'valor': val,
+                'data': data_str
             })
 
-            val_liquido = float(row['REAL_AMOUNT'])
-            if val_frete_real > 0:
-                val_frete_real = -val_frete_real
-            val_comissao = round(val_receita + val_frete_real - val_liquido, 2)
+            rows_conta_azul_confirmados.append(criar_lancamento(
+                op_id, data_str, CA_CATS['OUTROS'], val,
+                descricao_base, f"REVISAR: {tipo_transacao[:30]}"
+            ))
 
-            if abs(val_comissao) > 0.01:
-                rows_conta_azul_previsao.append({
-                    'ID Operação': op_id,
-                    'Data de Competência': data_competencia,
-                    'Data de Pagamento': data_caixa,
-                    'Categoria': CA_CATS['COMISSAO'],
-                    'Valor': -abs(val_comissao),
-                    'Centro de Custo': CENTRO_CUSTO,
-                    'Descrição': final_desc,
-                    'Observações': "Tarifa (PREVISÃO)"
-                })
-
-            if val_frete_real != 0:
-                rows_conta_azul_previsao.append({
-                    'ID Operação': op_id,
-                    'Data de Competência': data_competencia,
-                    'Data de Pagamento': data_caixa,
-                    'Categoria': CA_CATS['FRETE_ENVIO'],
-                    'Valor': val_frete_real,
-                    'Centro de Custo': CENTRO_CUSTO,
-                    'Descrição': final_desc,
-                    'Observações': "Frete (PREVISÃO)"
-                })
-
-        elif tipo_op in ['CHARGEBACK', 'REFUND', 'CANCELLATION', 'DISPUTE']:
-            val_receita = float(row['TRANSACTION_AMOUNT'])
-            rows_conta_azul_previsao.append({
-                'ID Operação': op_id,
-                'Data de Competência': data_competencia,
-                'Data de Pagamento': data_competencia,
-                'Categoria': CA_CATS['DEVOLUCAO'],
-                'Valor': val_receita if val_receita < 0 else -val_receita,
-                'Centro de Custo': CENTRO_CUSTO,
-                'Descrição': final_desc,
-                'Observações': f"{tipo_op} (PREVISÃO)"
-            })
-
-        elif 'PAYOUT' in str(tipo_op).upper() or 'RETIRADA' in str(tipo_op).upper() or tipo_op == 'MONEY_TRANSFER':
+        except Exception as e:
+            logger.error(f"Erro processando linha {idx}: {str(e)}")
             continue
 
-        else:
-            rows_conta_azul_previsao.append({
-                'ID Operação': op_id,
-                'Data de Competência': data_competencia,
-                'Data de Pagamento': data_competencia,
-                'Categoria': CA_CATS['OUTROS'],
-                'Valor': row['REAL_AMOUNT'],
-                'Centro de Custo': "",
-                'Descrição': final_desc,
-                'Observações': f"Verificar - {tipo_op}"
-            })
+    logger.info(f"Processadas {len(rows_conta_azul_confirmados)} transações confirmadas")
+    logger.info(f"Transações não classificadas: {len(rows_nao_classificados)}")
+
+    # ==============================================================================
+    # FASE 6: PROCESSAR PREVISÕES (DINHEIRO EM CONTA não liberado)
+    # ==============================================================================
+
+    logger.info("Fase 6: Processando PREVISÕES (dinheiro não liberado)...")
+
+    for _, row in dinheiro.iterrows():
+        try:
+            op_id = row.get('op_id', '')
+            if not op_id:
+                continue
+
+            tipo_op = str(row.get('TRANSACTION_TYPE', ''))
+
+            # Se já foi liberado (está no mapa de liberações), pula
+            if op_id in map_liberacoes:
+                continue
+
+            # Extrair datas
+            data_competencia = format_date(row.get('TRANSACTION_DATE', ''))
+            if op_id in map_vendas:
+                data_venda = map_vendas[op_id].get('data_venda', '')
+                if data_venda:
+                    data_competencia = format_date(data_venda)
+
+            data_caixa = format_date(row.get('MONEY_RELEASE_DATE', ''))
+            if not data_caixa and op_id in map_vendas:
+                data_caixa = format_date(map_vendas[op_id].get('data_liberacao', ''))
+
+            # Descrição
+            id_pedido = clean_id(row.get('EXTERNAL_REFERENCE', ''))
+            if not id_pedido:
+                id_pedido = clean_id(row.get('ORDER_ID', ''))
+            desc_part = f"Pedido {id_pedido}" if id_pedido else f"Op {op_id}"
+            descricao_base = f"{op_id} - {desc_part}"
+
+            if tipo_op == 'SETTLEMENT':
+                # Obter valores
+                if op_id in map_vendas:
+                    val_receita = map_vendas[op_id]['valor_produto']
+                else:
+                    val_receita = safe_float(row.get('TRANSACTION_AMOUNT', 0))
+
+                val_liquido = safe_float(row.get('REAL_AMOUNT', 0))
+                val_frete = safe_float(row.get('SHIPPING_FEE_AMOUNT', 0))
+
+                # Se valor negativo, é pagamento
+                if val_receita < 0:
+                    rows_pagamento_conta.append(criar_lancamento(
+                        op_id, data_caixa or data_competencia,
+                        CA_CATS['PAGAMENTO_CONTA'], val_receita,
+                        descricao_base, "Pagamento via Mercado Pago (PREVISÃO)"
+                    ))
+                    continue
+
+                # Receita (PREVISÃO)
+                rows_conta_azul_previsao.append(criar_lancamento(
+                    op_id, data_competencia,
+                    get_categoria_receita(op_id), val_receita,
+                    descricao_base, "Receita de venda (PREVISÃO)"
+                ))
+
+                # Calcular comissão
+                if val_frete > 0:
+                    val_frete = -val_frete
+                val_comissao = round(val_receita + val_frete - val_liquido, 2)
+
+                if abs(val_comissao) > 0.01:
+                    rows_conta_azul_previsao.append(criar_lancamento(
+                        op_id, data_competencia,
+                        CA_CATS['COMISSAO'], -abs(val_comissao),
+                        descricao_base, "Tarifa ML (PREVISÃO)"
+                    ))
+
+                if val_frete != 0:
+                    rows_conta_azul_previsao.append(criar_lancamento(
+                        op_id, data_competencia,
+                        CA_CATS['FRETE_ENVIO'], val_frete,
+                        descricao_base, "Frete (PREVISÃO)"
+                    ))
+
+            elif tipo_op in ['CHARGEBACK', 'REFUND', 'CANCELLATION', 'DISPUTE']:
+                val = safe_float(row.get('TRANSACTION_AMOUNT', 0))
+                if val > 0:
+                    val = -val  # Devoluções são negativas
+
+                rows_conta_azul_previsao.append(criar_lancamento(
+                    op_id, data_competencia,
+                    CA_CATS['DEVOLUCAO'], val,
+                    descricao_base, f"{tipo_op} (PREVISÃO)"
+                ))
+
+            elif tipo_op in ['PAYOUT', 'MONEY_TRANSFER'] or 'RETIRADA' in tipo_op.upper():
+                # Ignorar saques e transferências
+                continue
+
+            else:
+                # Outros tipos
+                val = safe_float(row.get('REAL_AMOUNT', 0))
+                if abs(val) > 0.01:
+                    rows_conta_azul_previsao.append(criar_lancamento(
+                        op_id, data_competencia,
+                        CA_CATS['OUTROS'], val,
+                        descricao_base, f"REVISAR: {tipo_op} (PREVISÃO)",
+                        centro=""
+                    ))
+
+        except Exception as e:
+            logger.error(f"Erro processando previsão op_id={op_id}: {str(e)}")
+            continue
+
+    logger.info(f"Processadas {len(rows_conta_azul_previsao)} previsões")
+
+    # ==============================================================================
+    # FASE 7: ESTATÍSTICAS E RETORNO
+    # ==============================================================================
 
     # Estatísticas de origem
     origens_count = {'ML': 0, 'LOJA': 0, 'BALCAO': 0}
     for origem in map_origem_venda.values():
         origens_count[origem] = origens_count.get(origem, 0) + 1
 
+    # Log de transações não classificadas para debug
+    if rows_nao_classificados:
+        logger.warning(f"⚠️ {len(rows_nao_classificados)} transações não classificadas:")
+        for nc in rows_nao_classificados[:10]:  # Mostrar até 10
+            logger.warning(f"  - {nc['op_id']}: {nc['tipo']} = R$ {nc['valor']:.2f}")
+
     return {
         'confirmados': rows_conta_azul_confirmados,
         'previsao': rows_conta_azul_previsao,
         'pagamentos': rows_pagamento_conta,
         'transferencias': rows_transferencias,
+        'nao_classificados': rows_nao_classificados,
         'stats': {
             'confirmados': len(rows_conta_azul_confirmados),
             'previsao': len(rows_conta_azul_previsao),
             'pagamentos': len(rows_pagamento_conta),
             'transferencias': len(rows_transferencias),
-            'origens': origens_count
+            'nao_classificados': len(rows_nao_classificados),
+            'origens': origens_count,
+            'ids_com_liberacao': len(ids_liberados)
         }
     }
 
