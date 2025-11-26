@@ -1112,9 +1112,10 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                 val_liquido = safe_float(row.get('REAL_AMOUNT', 0))
                 val_frete = safe_float(row.get('SHIPPING_FEE_AMOUNT', 0))
 
-                # Se valor negativo, é pagamento
+                # Se valor negativo, é pagamento - vai para PREVISÃO (não confirmado)
+                # Esses pagamentos só devem aparecer nos CONFIRMADOS quando estiverem no EXTRATO
                 if val_receita < 0:
-                    rows_pagamento_conta.append(criar_lancamento(
+                    rows_conta_azul_previsao.append(criar_lancamento(
                         op_id, data_caixa or data_competencia,
                         CA_CATS['PAGAMENTO_CONTA'], val_receita,
                         descricao_base, "Pagamento via Mercado Pago (PREVISÃO)"
