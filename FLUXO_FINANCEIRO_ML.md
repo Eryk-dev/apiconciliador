@@ -750,5 +750,63 @@ else:
 
 ---
 
+## 12. Separação CONFIRMADOS vs PREVISÃO
+
+### 12.1 Regra Fundamental
+
+O EXTRATO é a **fonte de verdade** para determinar se uma transação foi confirmada:
+
+```
+CONFIRMADOS = Transações presentes no EXTRATO (movimentaram a conta)
+PREVISÃO    = Transações do DINHEIRO EM CONTA que ainda não estão no EXTRATO
+```
+
+### 12.2 Pagamentos de Faturas ML (SETTLEMENT Negativo)
+
+Transações do tipo `SETTLEMENT` com valor **negativo** no relatório DINHEIRO EM CONTA representam pagamentos de faturas/cobranças automáticas do Mercado Livre.
+
+**Identificação:**
+- `TRANSACTION_TYPE` = SETTLEMENT
+- `REAL_AMOUNT` = valor negativo
+- `EXTERNAL_REFERENCE` contém "MELIPAYMENTS-COLLECTIONATTEMPT"
+
+**Tratamento:**
+
+| Presente no EXTRATO? | Destino | Arquivo |
+|---------------------|---------|---------|
+| Sim | CONFIRMADOS | PAGAMENTO_CONTAS.csv |
+| Não | PREVISÃO | IMPORTACAO_CONTA_AZUL_PREVISAO.csv |
+
+### 12.3 Exemplo Real
+
+```
+DINHEIRO EM CONTA:
+  ID: 130293587397
+  TRANSACTION_TYPE: SETTLEMENT
+  REAL_AMOUNT: -195.89
+  EXTERNAL_REFERENCE: MELIPAYMENTS-COLLECTIONATTEMPT-1541937786...
+
+EXTRATO:
+  (não encontrado)
+
+RESULTADO:
+  → Vai para PREVISÃO (categoria: 2.1.1 Compra de Mercadorias)
+  → NÃO vai para CONFIRMADOS
+```
+
+### 12.4 Validação
+
+A soma dos arquivos de saída deve bater com o EXTRATO:
+
+```
+CONFIRMADOS + PAGAMENTOS + TRANSFERÊNCIAS = EXTRATO (tolerância: R$ 0.10)
+```
+
+Se a diferença for maior, verificar:
+1. Transações do DINHEIRO EM CONTA sendo classificadas como CONFIRMADAS indevidamente
+2. IDs duplicados ou não mapeados corretamente
+
+---
+
 *Documento criado em: Novembro 2025*
-*Versão: 1.3 - Corrigido tratamento de frete vendedor vs comprador*
+*Versão: 1.4 - Adicionada regra de separação CONFIRMADOS vs PREVISÃO*

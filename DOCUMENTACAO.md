@@ -810,6 +810,34 @@ Comissão: R$ -XX,XX
 Frete:    R$ -16,41  (despesa real)
 ```
 
+### Separação CONFIRMADOS vs PREVISÃO
+
+A API separa rigorosamente transações **confirmadas** (presentes no EXTRATO) das **previsões** (ainda não movimentaram a conta):
+
+#### Regra Fundamental
+
+> **CONFIRMADOS:** Somente transações que aparecem no EXTRATO
+> **PREVISÃO:** Transações do DINHEIRO EM CONTA que ainda não estão no EXTRATO
+
+#### Tratamento de Pagamentos (SETTLEMENT Negativo)
+
+Transações do tipo `SETTLEMENT` com valor **negativo** no DINHEIRO EM CONTA representam pagamentos de faturas/cobranças do ML (ex: `MELIPAYMENTS-COLLECTIONATTEMPT`).
+
+| Situação | Destino | Motivo |
+|----------|---------|--------|
+| SETTLEMENT negativo **no EXTRATO** | CONFIRMADOS | Já movimentou a conta |
+| SETTLEMENT negativo **só no DINHEIRO EM CONTA** | PREVISÃO | Ainda não debitado |
+
+**Exemplo real:**
+```
+ID: 130293587397
+DINHEIRO EM CONTA: SETTLEMENT = -R$ 195,89
+EXTRATO: NÃO ENCONTRADO
+→ Vai para PREVISÃO (não para CONFIRMADOS)
+```
+
+Esta regra garante que a soma dos arquivos CONFIRMADOS + PAGAMENTOS + TRANSFERÊNCIAS seja **igual ao total do EXTRATO**.
+
 ### Documentação Técnica Adicional
 
 Para detalhes completos sobre o fluxo financeiro do Mercado Livre e o mapeamento de campos, consulte:
@@ -821,4 +849,4 @@ Para detalhes completos sobre o fluxo financeiro do Mercado Livre e o mapeamento
 ## Contato e Suporte
 
 - **Repositório:** https://github.com/Eryk-dev/apiconciliador
-- **Versão:** 2.2.0
+- **Versão:** 2.3.0
