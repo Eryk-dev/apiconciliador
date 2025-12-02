@@ -7,11 +7,12 @@ VERSÃO MELHORADA com:
 - Validação cruzada dos valores
 - Logging de transações não classificadas
 - Tratamento correto de devoluções e chargebacks
+- Suporte a arquivos ZIP com múltiplos CSVs (para períodos longos)
 
 Endpoint:
-    POST /conciliar - Recebe os relatórios CSV e retorna um ZIP com os arquivos processados
+    POST /conciliar - Recebe os relatórios CSV/ZIP e retorna um ZIP com os arquivos processados
 
-Arquivos esperados (form-data):
+Arquivos esperados (form-data) - Aceita CSV individual ou ZIP com múltiplos CSVs:
     - dinheiro: settlement report (obrigatório)
     - vendas: collection report (obrigatório)
     - pos_venda: after_collection report (obrigatório)
@@ -37,11 +38,85 @@ import tempfile
 import shutil
 import logging
 from datetime import datetime
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Union
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font
+
+
+# ==============================================================================
+# FUNÇÕES PARA PROCESSAMENTO DE ZIP
+# ==============================================================================
+
+def is_zip_file(content: bytes) -> bool:
+    """Verifica se o conteúdo é um arquivo ZIP pelo magic number"""
+    return content[:4] == b'PK\x03\x04'
+
+
+def extrair_csvs_do_zip(zip_content: bytes, skip_rows: int = 0, clean_json: bool = False) -> pd.DataFrame:
+    """
+    Extrai todos os arquivos CSV de um ZIP e concatena em um único DataFrame.
+
+    Args:
+        zip_content: Conteúdo binário do arquivo ZIP
+        skip_rows: Número de linhas a pular no início de cada CSV
+        clean_json: Se True, limpa campos JSON mal formatados
+
+    Returns:
+        DataFrame concatenado com todos os CSVs do ZIP
+    """
+    dataframes = []
+
+    with zipfile.ZipFile(io.BytesIO(zip_content), 'r') as zip_file:
+        # Listar todos os arquivos no ZIP
+        csv_files = [f for f in zip_file.namelist()
+                     if f.lower().endswith('.csv') and not f.startswith('__MACOSX')]
+
+        if not csv_files:
+            raise ValueError("Nenhum arquivo CSV encontrado dentro do ZIP")
+
+        logger.info(f"ZIP contém {len(csv_files)} arquivo(s) CSV: {csv_files}")
+
+        for csv_filename in csv_files:
+            try:
+                with zip_file.open(csv_filename) as csv_file:
+                    content = csv_file.read()
+                    content_str = content.decode('utf-8')
+
+                    if clean_json:
+                        # Remove campos JSON mal formatados
+                        content_str = re.sub(r'"\{[^}]*(?:\{[^}]*\}[^}]*)*\}"', '""', content_str)
+
+                    # Detectar separador automaticamente
+                    lines = content_str.split('\n')
+                    header_line = lines[skip_rows] if len(lines) > skip_rows else lines[0]
+                    sep = ';' if header_line.count(';') > header_line.count(',') else ','
+
+                    df = pd.read_csv(
+                        io.StringIO(content_str),
+                        sep=sep,
+                        skiprows=skip_rows,
+                        on_bad_lines='skip',
+                        index_col=False
+                    )
+
+                    if not df.empty:
+                        dataframes.append(df)
+                        logger.info(f"  - {csv_filename}: {len(df)} linhas")
+
+            except Exception as e:
+                logger.warning(f"Erro ao processar {csv_filename} do ZIP: {str(e)}")
+                continue
+
+    if not dataframes:
+        raise ValueError("Nenhum CSV válido foi extraído do ZIP")
+
+    # Concatenar todos os DataFrames
+    resultado = pd.concat(dataframes, ignore_index=True)
+    logger.info(f"Total após concatenação: {len(resultado)} linhas")
+
+    return resultado
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -1378,24 +1453,28 @@ async def root():
 
 @app.post("/conciliar")
 async def conciliar(
-    dinheiro: UploadFile = File(..., description="Arquivo settlement (dinheiro em conta)"),
-    vendas: UploadFile = File(..., description="Arquivo collection (vendas)"),
-    pos_venda: UploadFile = File(..., description="Arquivo after_collection (pós venda)"),
-    liberacoes: UploadFile = File(..., description="Arquivo reserve-release (liberações)"),
-    extrato: UploadFile = File(..., description="Arquivo account_statement (extrato)"),
-    retirada: Optional[UploadFile] = File(None, description="Arquivo withdraw (retirada) - opcional"),
+    dinheiro: UploadFile = File(..., description="Arquivo settlement (dinheiro em conta) - CSV ou ZIP"),
+    vendas: UploadFile = File(..., description="Arquivo collection (vendas) - CSV ou ZIP"),
+    pos_venda: UploadFile = File(..., description="Arquivo after_collection (pós venda) - CSV ou ZIP"),
+    liberacoes: UploadFile = File(..., description="Arquivo reserve-release (liberações) - CSV ou ZIP"),
+    extrato: UploadFile = File(..., description="Arquivo account_statement (extrato) - CSV ou ZIP"),
+    retirada: Optional[UploadFile] = File(None, description="Arquivo withdraw (retirada) - opcional - CSV ou ZIP"),
     centro_custo: str = Form("NETAIR", description="Centro de custo para os lançamentos")
 ):
     """
     Processa os relatórios do Mercado Livre e retorna um ZIP com os arquivos de importação.
 
-    ## Arquivos de entrada (CSV):
-    - **dinheiro**: settlement report (obrigatório)
-    - **vendas**: collection report (obrigatório)
-    - **pos_venda**: after_collection report (obrigatório)
-    - **liberacoes**: reserve-release report (obrigatório)
-    - **extrato**: account_statement report (obrigatório)
-    - **retirada**: withdraw report (opcional)
+    ## Arquivos de entrada (CSV ou ZIP):
+    Cada campo aceita um arquivo CSV individual OU um arquivo ZIP contendo múltiplos CSVs.
+    Quando um ZIP é enviado, todos os CSVs dentro dele são extraídos e concatenados automaticamente.
+    Isso é útil para períodos longos que geram múltiplos arquivos compactados.
+
+    - **dinheiro**: settlement report (obrigatório) - CSV ou ZIP
+    - **vendas**: collection report (obrigatório) - CSV ou ZIP
+    - **pos_venda**: after_collection report (obrigatório) - CSV ou ZIP
+    - **liberacoes**: reserve-release report (obrigatório) - CSV ou ZIP
+    - **extrato**: account_statement report (obrigatório) - CSV ou ZIP
+    - **retirada**: withdraw report (opcional) - CSV ou ZIP
 
     ## Parâmetros adicionais:
     - **centro_custo**: Centro de custo para os lançamentos (padrão: NETAIR)
@@ -1419,9 +1498,22 @@ async def conciliar(
         # Carregar DataFrames dos arquivos enviados
         arquivos = {}
 
-        # Função auxiliar para ler CSV com detecção automática de separador
+        # Função auxiliar para ler CSV ou ZIP com detecção automática
         async def ler_csv(upload_file: UploadFile, key: str, skip_rows: int = 0, clean_json: bool = False):
+            """
+            Lê um arquivo CSV ou ZIP contendo múltiplos CSVs.
+
+            Se o arquivo for um ZIP, extrai todos os CSVs e concatena em um único DataFrame.
+            Isso é útil quando períodos longos geram múltiplos arquivos compactados.
+            """
             content = await upload_file.read()
+
+            # Verificar se é um arquivo ZIP
+            if is_zip_file(content):
+                logger.info(f"Arquivo '{key}' detectado como ZIP - extraindo e concatenando CSVs...")
+                return extrair_csvs_do_zip(content, skip_rows=skip_rows, clean_json=clean_json)
+
+            # Processar como CSV normal
             content_str = content.decode('utf-8')
 
             if clean_json:
