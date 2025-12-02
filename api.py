@@ -1479,17 +1479,25 @@ async def conciliar(
     ## Parâmetros adicionais:
     - **centro_custo**: Centro de custo para os lançamentos (padrão: NETAIR)
 
-    ## Arquivos de saída (ZIP):
-    - IMPORTACAO_CONTA_AZUL_CONFIRMADOS.csv
-    - IMPORTACAO_CONTA_AZUL_CONFIRMADOS.xlsx
-    - IMPORTACAO_CONTA_AZUL_CONFIRMADOS_RESUMO.xlsx
-    - IMPORTACAO_CONTA_AZUL_PREVISAO.csv
-    - IMPORTACAO_CONTA_AZUL_PREVISAO.xlsx
-    - IMPORTACAO_CONTA_AZUL_PREVISAO_RESUMO.xlsx
-    - PAGAMENTO_CONTAS.csv
-    - PAGAMENTO_CONTAS.xlsx
-    - TRANSFERENCIAS.csv
+    ## Arquivos de saída (ZIP com pastas):
+
+    ### Conta Azul/ (arquivos principais para importação)
+    - CONFIRMADOS.xlsx
     - TRANSFERENCIAS.xlsx
+    - PAGAMENTO_CONTAS.xlsx
+
+    ### Resumo/ (agrupados por data e categoria)
+    - CONFIRMADOS_RESUMO.xlsx
+    - PREVISAO_RESUMO.xlsx
+    - TRANSFERENCIAS_RESUMO.xlsx
+    - PAGAMENTO_CONTAS_RESUMO.xlsx
+
+    ### Outros/ (CSVs e auxiliares)
+    - CONFIRMADOS.csv
+    - PREVISAO.csv
+    - PREVISAO.xlsx
+    - PAGAMENTO_CONTAS.csv
+    - TRANSFERENCIAS.csv
     """
 
     temp_dir = tempfile.mkdtemp()
@@ -1577,51 +1585,67 @@ async def conciliar(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Erro ao processar conciliação: {str(e)}")
 
-        # Gerar arquivos de saída
-        arquivos_gerados = []
+        # Gerar arquivos de saída organizados por pasta
+        # Estrutura:
+        #   Conta Azul/  - Arquivos principais para importação
+        #   Resumo/      - Arquivos resumidos (agrupados por data/categoria)
+        #   Outros/      - CSVs e arquivos auxiliares
 
-        # CSVs
-        if gerar_csv_conta_azul(resultado['confirmados'], os.path.join(temp_dir, 'IMPORTACAO_CONTA_AZUL_CONFIRMADOS.csv')):
-            arquivos_gerados.append('IMPORTACAO_CONTA_AZUL_CONFIRMADOS.csv')
+        arquivos_gerados = {}  # {caminho_no_zip: caminho_local}
 
-        if gerar_csv_conta_azul(resultado['previsao'], os.path.join(temp_dir, 'IMPORTACAO_CONTA_AZUL_PREVISAO.csv')):
-            arquivos_gerados.append('IMPORTACAO_CONTA_AZUL_PREVISAO.csv')
-
-        if gerar_csv_conta_azul(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.csv')):
-            arquivos_gerados.append('PAGAMENTO_CONTAS.csv')
-
-        if gerar_csv_conta_azul(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.csv')):
-            arquivos_gerados.append('TRANSFERENCIAS.csv')
-
-        # XLSXs Completos
-        if gerar_xlsx_completo(resultado['confirmados'], os.path.join(temp_dir, 'IMPORTACAO_CONTA_AZUL_CONFIRMADOS.xlsx')):
-            arquivos_gerados.append('IMPORTACAO_CONTA_AZUL_CONFIRMADOS.xlsx')
-
-        if gerar_xlsx_completo(resultado['previsao'], os.path.join(temp_dir, 'IMPORTACAO_CONTA_AZUL_PREVISAO.xlsx')):
-            arquivos_gerados.append('IMPORTACAO_CONTA_AZUL_PREVISAO.xlsx')
-
-        if gerar_xlsx_completo(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')):
-            arquivos_gerados.append('PAGAMENTO_CONTAS.xlsx')
+        # =====================================================================
+        # PASTA: Conta Azul (arquivos XLSX principais para importação)
+        # =====================================================================
+        if gerar_xlsx_completo(resultado['confirmados'], os.path.join(temp_dir, 'CONFIRMADOS.xlsx')):
+            arquivos_gerados['Conta Azul/CONFIRMADOS.xlsx'] = os.path.join(temp_dir, 'CONFIRMADOS.xlsx')
 
         if gerar_xlsx_completo(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')):
-            arquivos_gerados.append('TRANSFERENCIAS.xlsx')
+            arquivos_gerados['Conta Azul/TRANSFERENCIAS.xlsx'] = os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')
 
-        # XLSXs Resumidos
-        if gerar_xlsx_resumo(resultado['confirmados'], os.path.join(temp_dir, 'IMPORTACAO_CONTA_AZUL_CONFIRMADOS_RESUMO.xlsx')):
-            arquivos_gerados.append('IMPORTACAO_CONTA_AZUL_CONFIRMADOS_RESUMO.xlsx')
+        if gerar_xlsx_completo(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')):
+            arquivos_gerados['Conta Azul/PAGAMENTO_CONTAS.xlsx'] = os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')
 
-        if gerar_xlsx_resumo(resultado['previsao'], os.path.join(temp_dir, 'IMPORTACAO_CONTA_AZUL_PREVISAO_RESUMO.xlsx')):
-            arquivos_gerados.append('IMPORTACAO_CONTA_AZUL_PREVISAO_RESUMO.xlsx')
+        # =====================================================================
+        # PASTA: Resumo (arquivos agrupados por data/categoria)
+        # =====================================================================
+        if gerar_xlsx_resumo(resultado['confirmados'], os.path.join(temp_dir, 'CONFIRMADOS_RESUMO.xlsx')):
+            arquivos_gerados['Resumo/CONFIRMADOS_RESUMO.xlsx'] = os.path.join(temp_dir, 'CONFIRMADOS_RESUMO.xlsx')
+
+        if gerar_xlsx_resumo(resultado['previsao'], os.path.join(temp_dir, 'PREVISAO_RESUMO.xlsx')):
+            arquivos_gerados['Resumo/PREVISAO_RESUMO.xlsx'] = os.path.join(temp_dir, 'PREVISAO_RESUMO.xlsx')
+
+        if gerar_xlsx_resumo(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS_RESUMO.xlsx')):
+            arquivos_gerados['Resumo/TRANSFERENCIAS_RESUMO.xlsx'] = os.path.join(temp_dir, 'TRANSFERENCIAS_RESUMO.xlsx')
+
+        if gerar_xlsx_resumo(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS_RESUMO.xlsx')):
+            arquivos_gerados['Resumo/PAGAMENTO_CONTAS_RESUMO.xlsx'] = os.path.join(temp_dir, 'PAGAMENTO_CONTAS_RESUMO.xlsx')
+
+        # =====================================================================
+        # PASTA: Outros (CSVs e arquivos auxiliares)
+        # =====================================================================
+        if gerar_csv_conta_azul(resultado['confirmados'], os.path.join(temp_dir, 'CONFIRMADOS.csv')):
+            arquivos_gerados['Outros/CONFIRMADOS.csv'] = os.path.join(temp_dir, 'CONFIRMADOS.csv')
+
+        if gerar_csv_conta_azul(resultado['previsao'], os.path.join(temp_dir, 'PREVISAO.csv')):
+            arquivos_gerados['Outros/PREVISAO.csv'] = os.path.join(temp_dir, 'PREVISAO.csv')
+
+        if gerar_csv_conta_azul(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.csv')):
+            arquivos_gerados['Outros/PAGAMENTO_CONTAS.csv'] = os.path.join(temp_dir, 'PAGAMENTO_CONTAS.csv')
+
+        if gerar_csv_conta_azul(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.csv')):
+            arquivos_gerados['Outros/TRANSFERENCIAS.csv'] = os.path.join(temp_dir, 'TRANSFERENCIAS.csv')
+
+        if gerar_xlsx_completo(resultado['previsao'], os.path.join(temp_dir, 'PREVISAO.xlsx')):
+            arquivos_gerados['Outros/PREVISAO.xlsx'] = os.path.join(temp_dir, 'PREVISAO.xlsx')
 
         if not arquivos_gerados:
             raise HTTPException(status_code=500, detail="Nenhum arquivo foi gerado. Verifique os dados de entrada.")
 
-        # Criar ZIP em memória
+        # Criar ZIP em memória com estrutura de pastas
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for arquivo in arquivos_gerados:
-                file_path = os.path.join(temp_dir, arquivo)
-                zip_file.write(file_path, arquivo)
+            for caminho_zip, caminho_local in arquivos_gerados.items():
+                zip_file.write(caminho_local, caminho_zip)
 
         zip_buffer.seek(0)
 
