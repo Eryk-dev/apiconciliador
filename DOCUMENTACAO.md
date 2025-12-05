@@ -19,6 +19,7 @@
 9. [Mapeamento de Categorias](#mapeamento-de-categorias)
 10. [Exemplos de Uso](#exemplos-de-uso)
 11. [API V2 - Melhorias](#api-v2---melhorias)
+12. [API V2.4 - Correção de Divergência de Frete](#api-v24---correção-de-divergência-de-frete)
 
 ---
 
@@ -860,4 +861,87 @@ Para detalhes completos sobre o fluxo financeiro do Mercado Livre e o mapeamento
 ## Contato e Suporte
 
 - **Repositório:** https://github.com/Eryk-dev/apiconciliador
-- **Versão:** 2.3.0
+- **Versão:** 2.4.0
+
+---
+
+## API V2.4 - Correção de Divergência de Frete
+
+A versão 2.4 corrige um bug crítico que causava divergências entre o EXTRATO e os arquivos de saída.
+
+### Problema Identificado
+
+Em alguns casos, o frete do vendedor não estava sendo considerado corretamente, causando divergências de até **R$ 36.571,46** nos totais.
+
+**Cenários problemáticos:**
+
+1. **Reembolsos detalhados incorretamente**: O sistema detalhava reembolsos (gerando devolução + estorno de taxa + estorno de frete) quando o extrato já mostrava o valor líquido do reembolso, causando duplicação.
+
+2. **Frete com `SHIPPING_FEE=0` no LIBERAÇÕES**: Quando o LIBERAÇÕES não tinha o frete detalhado mas o VENDAS mostrava frete negativo, o sistema não sabia se deveria adicionar o frete como despesa ou não.
+
+### Solução Implementada
+
+#### 1. Reembolsos: Usar Valor Direto do Extrato
+
+Reembolsos agora usam o valor direto do extrato, sem detalhar em componentes:
+
+```python
+# ANTES (incorreto):
+if 'reembolso' in tipo_lower:
+    lancamentos = detalhar_refund(op_id, data_str, val, descricao_base)
+    # Gerava: devolução + estorno taxa + estorno frete (DUPLICAÇÃO!)
+
+# DEPOIS (correto):
+if 'reembolso' in tipo_lower:
+    if val > 0:
+        categoria = CA_CATS['ESTORNO_TAXA']
+    else:
+        categoria = CA_CATS['DEVOLUCAO']
+    # Usa valor direto do extrato
+```
+
+#### 2. Lógica Inteligente de Frete
+
+A nova lógica verifica se o frete foi **debitado separadamente** ou já está **incluso no NET**:
+
+```python
+# Verificar se o frete foi debitado separadamente ou já está no NET
+# Se EXTRATO ≈ LIB_NET, o frete já foi considerado (não adicionar)
+# Se EXTRATO ≈ LIB_NET + FRETE_VENDAS, o frete foi debitado separado (adicionar)
+frete_ja_considerado = abs(valor_extrato - liquido_calculado) < 0.10
+
+if abs(frete_lib) > 0.01:
+    # LIBERAÇÕES tem o frete, usar ele
+    frete_despesa = frete_lib
+elif not frete_ja_considerado:
+    # Frete foi debitado separadamente - adicionar
+    frete_despesa = -abs(frete_vendas)
+else:
+    # Frete já está no NET - não adicionar
+    frete_despesa = 0.0
+```
+
+### Resultado
+
+| Métrica | Antes | Depois |
+|---------|-------|--------|
+| Extrato | R$ -5.169,16 | R$ -5.169,16 |
+| Total Saída | R$ -41.740,62 | R$ -5.169,16 |
+| **Diferença** | **R$ 36.571,46** | **R$ 0,00** |
+| IDs divergentes | Centenas | **0** |
+
+### Cenários de Frete Cobertos
+
+| Cenário | EXTRATO | LIB_NET | Ação |
+|---------|---------|---------|------|
+| Frete no LIBERAÇÕES | R$ 702.67 | R$ 702.67 | Usar `SHIPPING_FEE` do LIBERAÇÕES |
+| Frete debitado separado | R$ 702.67 | R$ 747.12 | Usar frete do VENDAS |
+| Frete já incluso no NET | R$ 412.73 | R$ 412.73 | Não adicionar frete |
+
+### Funções Modificadas
+
+| Função | Modificação |
+|--------|-------------|
+| `detalhar_liberacao_payment()` | Adicionada lógica `frete_ja_considerado` |
+| `detalhar_transacao_assertiva()` | Mesma lógica para IDs múltiplos |
+| Processamento de reembolsos | Removido detalhamento, usa valor direto |

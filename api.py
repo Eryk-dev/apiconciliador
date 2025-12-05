@@ -494,30 +494,32 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             if vendedor_paga_frete:
                 # VENDEDOR paga frete: Receita = GROSS, Frete = despesa separada
                 receita = gross
-                frete_despesa = frete_lib  # Negativo, é despesa
+
+                # Verificar se o frete foi debitado separadamente ou já está no NET
+                # Se EXTRATO ≈ LIB_NET, o frete já foi considerado (não adicionar)
+                # Se EXTRATO ≈ LIB_NET + FRETE_VENDAS, o frete foi debitado separado (adicionar)
+                frete_ja_considerado = abs(valor_extrato - liquido_calculado) < 0.10
+
+                if abs(frete_lib) > 0.01:
+                    # LIBERAÇÕES tem o frete, usar ele
+                    frete_despesa = frete_lib  # Negativo, é despesa
+                elif not frete_ja_considerado:
+                    # Frete não está no LIBERAÇÕES E o extrato não bate com LIB_NET
+                    # Isso significa que o frete foi debitado separadamente
+                    frete_despesa = -abs(frete_vendas)  # Negativo, é despesa
+                else:
+                    # Frete já foi considerado no cálculo do NET (não adicionar)
+                    frete_despesa = 0.0
             else:
                 # COMPRADOR pagou frete: Receita = valor do produto (sem frete embutido)
                 # O frete entra no GROSS e sai no SHIPPING_FEE, é só repasse
                 receita = gross + frete_lib  # gross + (frete negativo) = valor produto
                 frete_despesa = 0.0  # Não lançar frete como despesa (é repasse)
 
-            # Verificar se há refund parcial associado
-            refund_gross = 0.0
-            refund_estorno_taxa = 0.0
-            refund_estorno_frete = 0.0
-
-            if 'refund' in map_liberacoes[op_id]:
-                refunds = map_liberacoes[op_id]['refund']
-                for ref in refunds:
-                    refund_gross += ref['gross_amount']  # Negativo = devolvido
-                    refund_estorno_taxa += ref['mp_fee'] + ref['financing_fee']  # Positivo = estornado
-                    refund_estorno_frete += ref['shipping_fee']  # Positivo = estornado
-                    liquido_calculado += ref['net_amount']
-
-            # Validação: o líquido calculado deve bater com o extrato
-            diferenca = abs(liquido_calculado - valor_extrato)
-            if diferenca > 0.10:
-                logger.warning(f"DISCREPÂNCIA op_id={op_id}: extrato={valor_extrato}, calculado={liquido_calculado}, diff={diferenca}")
+            # IMPORTANTE: NÃO incluir refund parcial no detalhamento aqui.
+            # Se houver refund parcial, ele deve aparecer como linha SEPARADA no extrato
+            # e será processado quando essa linha for processada.
+            # Incluir o refund aqui causaria duplicação de lançamentos.
 
             # LANÇAMENTO 1: Receita
             if abs(receita) > 0.01:
@@ -549,48 +551,31 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                     "Frete de envio (MercadoEnvios)"
                 ))
 
-            # LANÇAMENTO 4: Refund parcial (se houver)
-            if abs(refund_gross) > 0.01:
-                lancamentos.append(criar_lancamento(
-                    op_id, data_str,
-                    CA_CATS['DEVOLUCAO'],
-                    refund_gross,  # Já é negativo
-                    descricao_base,
-                    "Devolução parcial"
-                ))
-
-            # LANÇAMENTO 5: Estorno de taxa (se houve refund)
-            if refund_estorno_taxa > 0.01:
-                lancamentos.append(criar_lancamento(
-                    op_id, data_str,
-                    CA_CATS['ESTORNO_TAXA'],
-                    refund_estorno_taxa,
-                    descricao_base,
-                    "Estorno de taxa (devolução parcial)"
-                ))
-
-            # LANÇAMENTO 6: Estorno de frete (se houve refund)
-            if refund_estorno_frete > 0.01:
-                lancamentos.append(criar_lancamento(
-                    op_id, data_str,
-                    CA_CATS['ESTORNO_FRETE'],
-                    refund_estorno_frete,
-                    descricao_base,
-                    "Estorno de frete (devolução parcial)"
-                ))
-
         else:
             # Fallback: não tem detalhes no LIBERAÇÕES
-            # Tenta usar dados do DINHEIRO EM CONTA
-            logger.info(f"op_id={op_id} sem detalhes em LIBERAÇÕES, usando fallback")
+            # Tenta usar dados do VENDAS para detalhar
+            logger.info(f"op_id={op_id} sem detalhes em LIBERAÇÕES, usando fallback VENDAS")
 
             if op_id in map_vendas:
                 venda = map_vendas[op_id]
                 receita = venda['valor_produto']
+                frete_vendas = venda.get('frete_comprador', 0.0)
+
+                # frete_vendas < 0 indica que o vendedor paga o frete
+                vendedor_paga_frete = frete_vendas < -0.01
+                frete_abs = abs(frete_vendas)
+
                 if receita > 0:
-                    # Calcula comissão por diferença
-                    comissao = receita - valor_extrato
+                    # Calcula comissão por diferença, considerando o frete
+                    # valor_extrato = receita - comissão - frete (se vendedor paga)
+                    # Então: comissão = receita - valor_extrato - frete
+                    if vendedor_paga_frete:
+                        comissao = receita - valor_extrato - frete_abs
+                    else:
+                        comissao = receita - valor_extrato
+
                     if comissao > 0:
+                        # LANÇAMENTO 1: Receita
                         lancamentos.append(criar_lancamento(
                             op_id, data_str,
                             get_categoria_receita(op_id),
@@ -598,6 +583,8 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                             descricao_base,
                             "Receita de venda (estimada)"
                         ))
+
+                        # LANÇAMENTO 2: Comissão
                         lancamentos.append(criar_lancamento(
                             op_id, data_str,
                             CA_CATS['COMISSAO'],
@@ -605,8 +592,18 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                             descricao_base,
                             "Tarifa ML (calculada por diferença)"
                         ))
+
+                        # LANÇAMENTO 3: Frete (somente se vendedor paga)
+                        if vendedor_paga_frete and frete_abs > 0.01:
+                            lancamentos.append(criar_lancamento(
+                                op_id, data_str,
+                                CA_CATS['FRETE_ENVIO'],
+                                -frete_abs,
+                                descricao_base,
+                                "Frete de envio (MercadoEnvios)"
+                            ))
                     else:
-                        # Não conseguiu calcular, usa valor total
+                        # Não conseguiu calcular comissão positiva, usa valor do extrato direto
                         lancamentos.append(criar_lancamento(
                             op_id, data_str,
                             get_categoria_receita(op_id),
@@ -614,6 +611,15 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                             descricao_base,
                             "Liberação de venda (sem detalhamento)"
                         ))
+                else:
+                    # Receita = 0, usa valor do extrato direto
+                    lancamentos.append(criar_lancamento(
+                        op_id, data_str,
+                        get_categoria_receita(op_id),
+                        valor_extrato,
+                        descricao_base,
+                        "Liberação de venda (sem detalhamento)"
+                    ))
             else:
                 # Último fallback: valor total como receita
                 lancamentos.append(criar_lancamento(
@@ -780,7 +786,17 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             if vendedor_paga_frete:
                 # VENDEDOR paga frete: Receita = GROSS, Frete = despesa separada
                 receita = gross
-                frete_despesa = frete_lib
+
+                # Verificar se o frete foi debitado separadamente ou já está no NET
+                liquido_lib = lib['net_amount']
+                frete_ja_considerado = abs(valor_extrato - liquido_lib) < 0.10
+
+                if abs(frete_lib) > 0.01:
+                    frete_despesa = frete_lib
+                elif not frete_ja_considerado:
+                    frete_despesa = -abs(frete_vendas)
+                else:
+                    frete_despesa = 0.0
             else:
                 # COMPRADOR pagou frete: Receita = valor do produto (sem frete)
                 receita = gross + frete_lib  # gross + (frete negativo) = valor produto
@@ -818,32 +834,20 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             ))
 
         # =========================================================================
-        # REEMBOLSO (refund) - Detalha estornos de taxa e frete
+        # REEMBOLSO (refund) - NÃO detalhar, usar valor direto do extrato
+        # O extrato já mostra o valor líquido. Detalhar geraria duplicação.
         # =========================================================================
         elif 'reembolso' in tipo_lower:
-            # refund: MP_FEE e SHIPPING_FEE são positivos = estornados
-            estorno_taxa = lib['mp_fee'] + lib['financing_fee']
-            estorno_frete = lib['shipping_fee']
-
-            # Se gross_amount for negativo, é devolução de valor ao comprador
-            if lib['gross_amount'] < -0.01:
-                lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['DEVOLUCAO'],
-                    lib['gross_amount'], descricao_base, "Devolução ao comprador"
-                ))
-
-            # Estorno de taxa (positivo)
-            if estorno_taxa > 0.01:
+            # Usar valor direto do extrato - classificar pela natureza do valor
+            if valor_extrato > 0:
                 lancamentos.append(criar_lancamento(
                     op_id, data_str, CA_CATS['ESTORNO_TAXA'],
-                    estorno_taxa, descricao_base, "Estorno de taxa ML"
+                    valor_extrato, descricao_base, "Estorno/Reembolso"
                 ))
-
-            # Estorno de frete (positivo)
-            if estorno_frete > 0.01:
+            else:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['ESTORNO_FRETE'],
-                    estorno_frete, descricao_base, "Estorno de frete"
+                    op_id, data_str, CA_CATS['DEVOLUCAO'],
+                    valor_extrato, descricao_base, "Devolução ao comprador"
                 ))
 
         # =========================================================================
@@ -984,30 +988,24 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
             # =====================================================================
             # CATEGORIA 5: REEMBOLSO
-            # Detalha usando dados do LIBERAÇÕES
+            # IMPORTANTE: Usar valor direto do extrato - não detalhar!
+            # O extrato já mostra o valor líquido do reembolso.
+            # Detalhar geraria duplicação de estornos de taxa.
             # =====================================================================
             if tipo_transacao.strip().startswith('Reembolso') or 'reembolso' in tipo_lower:
-                if is_id_multiplo:
-                    # Para IDs múltiplos, usar detalhamento assertivo
-                    lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_str, val, descricao_base)
-                    if lancamentos:
-                        rows_conta_azul_confirmados.extend(lancamentos)
-                    else:
-                        # Fallback: valor direto
-                        if val > 0:
-                            rows_conta_azul_confirmados.append(criar_lancamento(
-                                op_id, data_str, CA_CATS['ESTORNO_TAXA'], val,
-                                descricao_base, "Estorno (envío cancelado/devolução)"
-                            ))
-                        else:
-                            rows_conta_azul_confirmados.append(criar_lancamento(
-                                op_id, data_str, CA_CATS['DEVOLUCAO'], val,
-                                descricao_base, "Devolução ao comprador"
-                            ))
+                # Usar valor direto do extrato - classificar pela natureza do valor
+                if val > 0:
+                    # Positivo = estorno (dinheiro voltando para o vendedor)
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str, CA_CATS['ESTORNO_TAXA'], val,
+                        descricao_base, "Estorno/Reembolso"
+                    ))
                 else:
-                    # Para IDs únicos, detalhar usando LIBERAÇÕES
-                    lancamentos = detalhar_refund(op_id, data_str, val, descricao_base)
-                    rows_conta_azul_confirmados.extend(lancamentos)
+                    # Negativo = devolução (dinheiro saindo do vendedor)
+                    rows_conta_azul_confirmados.append(criar_lancamento(
+                        op_id, data_str, CA_CATS['DEVOLUCAO'], val,
+                        descricao_base, "Devolução ao comprador"
+                    ))
                 continue
 
             # =====================================================================
@@ -1072,14 +1070,9 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
             # Débitos diversos
             if 'débito' in tipo_lower or 'debito' in tipo_lower or 'dívida' in tipo_lower or 'divida' in tipo_lower:
-                # Para IDs múltiplos com reclamação, tentar detalhamento assertivo
-                if is_id_multiplo and 'reclama' in tipo_lower:
-                    lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_str, val, descricao_base)
-                    if lancamentos:
-                        rows_conta_azul_confirmados.extend(lancamentos)
-                        continue
-
-                # Fallback: categorizar pelo tipo
+                # IMPORTANTE: Usar valor direto do extrato - não detalhar!
+                # O extrato já mostra o valor líquido do débito.
+                # Categorizar pelo tipo
                 if 'reclama' in tipo_lower:
                     categoria = CA_CATS['DEVOLUCAO']
                     obs = "Débito por reclamação ML"

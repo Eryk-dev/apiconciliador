@@ -808,5 +808,156 @@ Se a diferença for maior, verificar:
 
 ---
 
+---
+
+## 13. Lógica Avançada de Frete (V2.4)
+
+### 13.1 O Problema do Frete Debitado Separadamente
+
+Em alguns casos, o frete não aparece no campo `SHIPPING_FEE_AMOUNT` do LIBERAÇÕES, mas foi cobrado em uma transação separada. Isso causa divergência entre o valor do EXTRATO e o cálculo baseado no LIBERAÇÕES.
+
+**Exemplo real:**
+```
+ID: 130071024955
+
+LIBERAÇÕES:
+  GROSS_AMOUNT:     R$  965.06
+  MP_FEE_AMOUNT:    R$ -101.88
+  FINANCING_FEE:    R$ -116.06
+  SHIPPING_FEE:     R$    0.00  ← Frete não aparece aqui!
+  NET_CREDIT:       R$  747.12
+
+VENDAS:
+  Valor produto:    R$  849.00
+  Frete:            R$  -44.45  ← Vendedor paga frete
+
+EXTRATO:
+  Valor líquido:    R$  702.67  ← Diferença de R$ 44.45!
+
+Relação:
+  747.12 - 44.45 = 702.67 ✓
+```
+
+### 13.2 Como Identificar Frete Debitado Separadamente
+
+A lógica usa a comparação entre o valor do EXTRATO e o `NET_CREDIT` do LIBERAÇÕES:
+
+| Comparação | Significado | Ação |
+|------------|-------------|------|
+| `EXTRATO ≈ LIB_NET` | Frete já está incluso no NET | **Não adicionar** frete |
+| `EXTRATO ≈ LIB_NET + VENDAS.Frete` | Frete foi debitado separado | **Adicionar** frete como despesa |
+
+### 13.3 Algoritmo de Decisão
+
+```python
+# Dados de entrada
+valor_extrato = 702.67          # Do EXTRATO
+liquido_lib = 747.12            # NET_CREDIT do LIBERAÇÕES
+frete_vendas = -44.45           # Do VENDAS (negativo = vendedor paga)
+frete_lib = 0.0                 # SHIPPING_FEE do LIBERAÇÕES
+
+# Verificar se frete já está considerado no NET
+frete_ja_considerado = abs(valor_extrato - liquido_lib) < 0.10
+
+# Resultado: frete_ja_considerado = False (diferença = 44.45)
+
+# Decisão
+if abs(frete_lib) > 0.01:
+    # Caso 1: LIBERAÇÕES tem frete - usar ele
+    frete_despesa = frete_lib
+elif not frete_ja_considerado:
+    # Caso 2: Frete foi debitado separadamente - usar VENDAS
+    frete_despesa = -abs(frete_vendas)  # = -44.45
+else:
+    # Caso 3: Frete já incluso no NET - não adicionar
+    frete_despesa = 0.0
+```
+
+### 13.4 Exemplos Práticos
+
+**Caso A: Frete debitado separadamente (ID 130071024955)**
+```
+EXTRATO:     R$ 702.67
+LIB_NET:     R$ 747.12
+Diferença:   R$  44.45 (> 0.10)
+→ frete_ja_considerado = False
+→ Adicionar frete de R$ -44.45
+
+Lançamentos:
+  Receita:   R$  965.06
+  Comissão:  R$ -217.94
+  Frete:     R$  -44.45
+  TOTAL:     R$  702.67 ✓
+```
+
+**Caso B: Frete já incluso no NET (ID 133247277405)**
+```
+EXTRATO:     R$ 412.73
+LIB_NET:     R$ 412.73
+Diferença:   R$   0.00 (< 0.10)
+→ frete_ja_considerado = True
+→ NÃO adicionar frete
+
+Lançamentos:
+  Receita:   R$ 412.73
+  Comissão:  R$   0.00
+  Frete:     R$   0.00  (não lança)
+  TOTAL:     R$ 412.73 ✓
+```
+
+### 13.5 Tratamento de Reembolsos
+
+Reembolsos **NÃO devem ser detalhados**. O EXTRATO já mostra o valor líquido do reembolso, e detalhar causaria duplicação:
+
+```
+❌ INCORRETO (detalhamento):
+  Reembolso no extrato: R$ -100.00
+  Detalhamento gera:
+    Devolução:        R$ -120.00
+    Estorno taxa:     R$   15.00
+    Estorno frete:    R$    5.00
+    TOTAL:            R$ -100.00
+
+  MAS se houver linhas separadas no extrato para estornos,
+  teremos DUPLICAÇÃO!
+
+✓ CORRETO (valor direto):
+  Reembolso no extrato: R$ -100.00
+  Lançamento gerado:
+    Devolução:        R$ -100.00  (valor direto do extrato)
+```
+
+### 13.6 Resumo da Lógica V2.4
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DECISÃO DE FRETE                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. LIBERAÇÕES tem SHIPPING_FEE ≠ 0?                           │
+│     └── SIM → Usar SHIPPING_FEE do LIBERAÇÕES                  │
+│     └── NÃO → Continuar para passo 2                           │
+│                                                                 │
+│  2. EXTRATO ≈ LIB_NET? (tolerância R$ 0.10)                    │
+│     └── SIM → Frete já incluso, NÃO adicionar                  │
+│     └── NÃO → Frete debitado separado, usar VENDAS.Frete       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    TRATAMENTO DE REEMBOLSO                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  SEMPRE usar valor direto do EXTRATO                            │
+│  NUNCA detalhar em componentes (evita duplicação)               │
+│                                                                 │
+│  SE valor > 0 → Categoria: Estorno de Taxa                      │
+│  SE valor < 0 → Categoria: Devolução                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 *Documento criado em: Novembro 2025*
-*Versão: 1.4 - Adicionada regra de separação CONFIRMADOS vs PREVISÃO*
+*Versão: 1.5 - Adicionada lógica avançada de frete (V2.4)*
