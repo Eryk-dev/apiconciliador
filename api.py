@@ -1537,6 +1537,84 @@ async def conciliar(
                 index_col=False
             )
 
+        async def ler_extrato(upload_file: UploadFile):
+            """
+            Lê o arquivo de extrato (account_statement) com tratamento especial para
+            linhas que têm campos extras devido a separadores no nome da empresa.
+
+            O extrato tem 5 colunas:
+            RELEASE_DATE;TRANSACTION_TYPE;REFERENCE_ID;TRANSACTION_NET_AMOUNT;PARTIAL_BALANCE
+
+            Quando o TRANSACTION_TYPE contém ';', a linha fica com mais de 5 campos.
+            Esta função junta os campos extras no TRANSACTION_TYPE.
+            """
+            content = await upload_file.read()
+
+            # Verificar se é ZIP
+            if is_zip_file(content):
+                logger.info("Arquivo 'extrato' detectado como ZIP - extraindo e concatenando CSVs...")
+                # Para ZIP, usar tratamento padrão por enquanto
+                return extrair_csvs_do_zip(content, skip_rows=3, clean_json=False)
+
+            content_str = content.decode('utf-8')
+            lines = content_str.split('\n')
+
+            # Pular as 3 primeiras linhas (cabeçalho resumo)
+            # Linha 0: INITIAL_BALANCE;CREDITS;DEBITS;FINAL_BALANCE
+            # Linha 1: valores
+            # Linha 2: vazia
+            # Linha 3: cabeçalho das colunas (RELEASE_DATE;TRANSACTION_TYPE;...)
+
+            if len(lines) < 4:
+                raise ValueError("Arquivo de extrato inválido - menos de 4 linhas")
+
+            header = lines[3].strip().split(';')
+            expected_cols = 5  # RELEASE_DATE, TRANSACTION_TYPE, REFERENCE_ID, TRANSACTION_NET_AMOUNT, PARTIAL_BALANCE
+
+            data_rows = []
+            linhas_corrigidas = 0
+
+            for line_num, line in enumerate(lines[4:], start=5):
+                line = line.strip()
+                if not line:
+                    continue
+
+                campos = line.split(';')
+
+                if len(campos) == expected_cols:
+                    # Linha normal
+                    data_rows.append(campos)
+                elif len(campos) > expected_cols:
+                    # Linha com campos extras - juntar os extras no TRANSACTION_TYPE
+                    # campos[0] = RELEASE_DATE
+                    # campos[1:-3] = partes do TRANSACTION_TYPE
+                    # campos[-3] = REFERENCE_ID
+                    # campos[-2] = TRANSACTION_NET_AMOUNT
+                    # campos[-1] = PARTIAL_BALANCE
+                    extra_count = len(campos) - expected_cols
+                    transaction_type_parts = campos[1:2+extra_count]
+                    transaction_type = ' '.join(transaction_type_parts)
+
+                    fixed_row = [
+                        campos[0],                    # RELEASE_DATE
+                        transaction_type,             # TRANSACTION_TYPE (juntado)
+                        campos[-3],                   # REFERENCE_ID
+                        campos[-2],                   # TRANSACTION_NET_AMOUNT
+                        campos[-1]                    # PARTIAL_BALANCE
+                    ]
+                    data_rows.append(fixed_row)
+                    linhas_corrigidas += 1
+                    logger.info(f"Extrato linha {line_num}: corrigida ({len(campos)} campos -> 5)")
+                else:
+                    # Linha com menos campos que o esperado - ignorar
+                    logger.warning(f"Extrato linha {line_num}: ignorada ({len(campos)} campos < 5)")
+
+            if linhas_corrigidas > 0:
+                logger.info(f"Extrato: {linhas_corrigidas} linha(s) com campos extras foram corrigidas")
+
+            df = pd.DataFrame(data_rows, columns=header[:expected_cols])
+            return df
+
         # Carregar arquivos obrigatórios
         try:
             arquivos['dinheiro'] = await ler_csv(dinheiro, 'dinheiro', clean_json=True)
@@ -1559,7 +1637,7 @@ async def conciliar(
             raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'liberacoes': {str(e)}")
 
         try:
-            arquivos['extrato'] = await ler_csv(extrato, 'extrato', skip_rows=3)
+            arquivos['extrato'] = await ler_extrato(extrato)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'extrato': {str(e)}")
 
