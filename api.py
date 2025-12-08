@@ -1,7 +1,19 @@
 """
-API do Super Conciliador V2 - Mercado Livre -> Conta Azul
+API do Super Conciliador V2.5.1 - Mercado Livre -> Conta Azul
 
-VERSÃO MELHORADA com:
+VERSÃO 2.5.1 (2025-12-08):
+- CORREÇÃO: Validação em detalhar_liberacao_payment() - se soma divergir do extrato,
+  usa valor direto do extrato e registra em DIVERGENCIAS_FALLBACK.csv
+- NOVO: Arquivo DIVERGENCIAS_FALLBACK.csv para conferência de IDs com divergência
+
+VERSÃO 2.5.0 (2025-12-06):
+- CORREÇÃO: Tratamento de IDs com valor consolidado no extrato (payment - refund)
+  quando o ID aparece 1 vez no extrato mas tem múltiplos registros no LIBERAÇÕES
+- CORREÇÃO: Validação na função detalhar_transacao_assertiva() para garantir que
+  a soma dos lançamentos bata com o valor do extrato
+- Nova função calcular_soma_liberacoes() para verificar consolidação
+
+VERSÃO 2.0 (base):
 - Cruzamento de dados baseado no EXTRATO como fonte da verdade
 - Detalhamento correto de receita, comissão e frete usando LIBERAÇÕES
 - Validação cruzada dos valores
@@ -381,6 +393,7 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
     rows_pagamento_conta = []
     rows_transferencias = []
     rows_nao_classificados = []  # Para rastreabilidade
+    rows_divergencias_fallback = []  # V2.5.1: IDs que usaram fallback com divergência
 
     # Preparar EXTRATO
     extrato['Valor'] = extrato['TRANSACTION_NET_AMOUNT'].apply(clean_float_extrato)
@@ -401,6 +414,31 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             'Descrição': descricao,
             'Observações': observacoes
         }
+
+    def calcular_soma_liberacoes(op_id: str) -> float:
+        """
+        Calcula a soma de todos os NET_AMOUNT para um ID no LIBERAÇÕES.
+
+        Isso é útil para verificar se o extrato mostra um valor consolidado
+        (payment - refund) quando o ID aparece apenas 1 vez no extrato mas
+        tem múltiplos registros no LIBERAÇÕES.
+
+        Returns:
+            Soma de todos os NET_AMOUNT (credit - debit) para o ID
+        """
+        if op_id not in map_liberacoes:
+            return 0.0
+
+        soma = 0.0
+        for desc, dados in map_liberacoes[op_id].items():
+            if isinstance(dados, list):
+                # Múltiplos registros (refund, chargeback, mediation, etc.)
+                for d in dados:
+                    soma += d.get('net_amount', 0)
+            else:
+                # Registro único (payment)
+                soma += dados.get('net_amount', 0)
+        return soma
 
     def buscar_liberacao_por_tipo_e_valor(op_id: str, tipo_extrato: str, valor_extrato: float) -> Optional[Dict]:
         """
@@ -630,6 +668,33 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                     "Liberação de venda (sem detalhamento)"
                 ))
 
+        # V2.5.1: VALIDAÇÃO FINAL - Se soma dos lançamentos divergir do extrato, usar valor direto
+        soma_lancamentos = sum(l['Valor'] for l in lancamentos)
+        if abs(soma_lancamentos - valor_extrato) > 0.10:
+            # Divergência detectada - registrar e usar valor direto do extrato
+            valor_esperado_vendas = map_vendas.get(op_id, {}).get('net_received', soma_lancamentos)
+            rows_divergencias_fallback.append({
+                'ID': op_id,
+                'Data': data_str,
+                'Tipo': 'Liberação de dinheiro',
+                'Valor_Extrato': valor_extrato,
+                'Valor_Calculado': soma_lancamentos,
+                'Valor_Vendas': valor_esperado_vendas,
+                'Diferenca': round(soma_lancamentos - valor_extrato, 2),
+                'Fonte_Original': 'VENDAS' if op_id not in map_liberacoes else 'LIBERACOES',
+                'Observacao': 'Usado valor direto do EXTRATO por divergência'
+            })
+            logger.warning(f"op_id={op_id}: Divergência detectada! Extrato={valor_extrato:.2f}, Calculado={soma_lancamentos:.2f}. Usando valor do extrato.")
+
+            # Substituir lançamentos pelo valor direto do extrato
+            lancamentos = [criar_lancamento(
+                op_id, data_str,
+                get_categoria_receita(op_id),
+                valor_extrato,
+                descricao_base,
+                "Liberação de venda (ajustado - ver DIVERGENCIAS)"
+            )]
+
         return lancamentos
 
     def detalhar_refund(op_id: str, data_str: str, valor_extrato: float,
@@ -822,6 +887,14 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                     -abs(frete_despesa), descricao_base, "Frete de envio (MercadoEnvios)"
                 ))
 
+            # V2.5: VALIDAÇÃO - A soma dos lançamentos deve bater com o valor do extrato
+            # Se não bater, significa que há algo diferente (ex: frete debitado separadamente)
+            # Nesse caso, retorna lista vazia para usar o fallback (valor direto)
+            soma_lancamentos = sum(l['Valor'] for l in lancamentos)
+            if abs(soma_lancamentos - valor_extrato) > 0.10:
+                logger.info(f"op_id={op_id}: soma lançamentos ({soma_lancamentos:.2f}) != extrato ({valor_extrato:.2f}), usando fallback")
+                return []  # Usar valor direto do extrato
+
         # =========================================================================
         # DÉBITO POR DÍVIDA / MEDIAÇÃO - Valor negativo direto
         # =========================================================================
@@ -959,8 +1032,28 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             is_id_multiplo = op_id in ids_multiplos
 
             if is_liberacao and has_payment_data:
+                # V2.5: Verificar se tem refund/chargeback no LIBERAÇÕES
+                # Isso indica que pode haver valor consolidado no extrato
+                tipos_lib = list(map_liberacoes.get(op_id, {}).keys())
+                tem_refund_lib = any(t in tipos_lib for t in ['refund', 'chargeback', 'mediation'])
+
+                # V2.5: Se tem refund no LIBERAÇÕES mas é ID único no extrato,
+                # verificar se o extrato mostra valor consolidado (payment - refund)
+                if tem_refund_lib and not is_id_multiplo:
+                    soma_lib = calcular_soma_liberacoes(op_id)
+                    valor_consolidado = abs(val - soma_lib) < 0.10
+
+                    if valor_consolidado:
+                        # Extrato mostra valor consolidado (payment - refund já aplicado)
+                        # Usar valor direto do extrato sem detalhar para evitar duplicação
+                        rows_conta_azul_confirmados.append(criar_lancamento(
+                            op_id, data_str, get_categoria_receita(op_id), val,
+                            descricao_base, "Liberação de venda (consolidada)"
+                        ))
+                        continue
+
                 if is_id_multiplo:
-                    # Para IDs múltiplos, usar detalhamento assertivo
+                    # Para IDs múltiplos no extrato, usar detalhamento assertivo
                     lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_str, val, descricao_base)
                     if lancamentos:
                         rows_conta_azul_confirmados.extend(lancamentos)
@@ -971,7 +1064,7 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                             descricao_base, "Liberação de venda"
                         ))
                 else:
-                    # Para IDs únicos, usar detalhamento completo (com refund parcial se houver)
+                    # Para IDs únicos sem refund consolidado, usar detalhamento completo
                     lancamentos = detalhar_liberacao_payment(op_id, data_str, val, descricao_base)
                     rows_conta_azul_confirmados.extend(lancamentos)
                 continue
@@ -1264,18 +1357,26 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
         for nc in rows_nao_classificados[:10]:  # Mostrar até 10
             logger.warning(f"  - {nc['op_id']}: {nc['tipo']} = R$ {nc['valor']:.2f}")
 
+    # V2.5.1: Log de divergências encontradas
+    if rows_divergencias_fallback:
+        logger.warning(f"⚠️ {len(rows_divergencias_fallback)} IDs com divergência de valor (ver DIVERGENCIAS_FALLBACK.csv):")
+        for div in rows_divergencias_fallback[:5]:
+            logger.warning(f"  - {div['ID']}: Extrato={div['Valor_Extrato']:.2f}, Calculado={div['Valor_Calculado']:.2f}, Diff={div['Diferenca']:.2f}")
+
     return {
         'confirmados': rows_conta_azul_confirmados,
         'previsao': rows_conta_azul_previsao,
         'pagamentos': rows_pagamento_conta,
         'transferencias': rows_transferencias,
         'nao_classificados': rows_nao_classificados,
+        'divergencias_fallback': rows_divergencias_fallback,  # V2.5.1
         'stats': {
             'confirmados': len(rows_conta_azul_confirmados),
             'previsao': len(rows_conta_azul_previsao),
             'pagamentos': len(rows_pagamento_conta),
             'transferencias': len(rows_transferencias),
             'nao_classificados': len(rows_nao_classificados),
+            'divergencias_fallback': len(rows_divergencias_fallback),  # V2.5.1
             'origens': origens_count,
             'ids_com_liberacao': len(ids_liberados)
         }
@@ -1705,6 +1806,14 @@ async def conciliar(
 
         if gerar_csv_conta_azul(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.csv')):
             arquivos_gerados['Outros/TRANSFERENCIAS.csv'] = os.path.join(temp_dir, 'TRANSFERENCIAS.csv')
+
+        # V2.5.1: Gerar arquivo de divergências para conferência
+        if resultado.get('divergencias_fallback'):
+            div_path = os.path.join(temp_dir, 'DIVERGENCIAS_FALLBACK.csv')
+            df_div = pd.DataFrame(resultado['divergencias_fallback'])
+            df_div.to_csv(div_path, sep=';', index=False, encoding='utf-8-sig')
+            arquivos_gerados['Outros/DIVERGENCIAS_FALLBACK.csv'] = div_path
+            logger.info(f"Gerado arquivo de divergências com {len(resultado['divergencias_fallback'])} registros")
 
         if gerar_xlsx_completo(resultado['previsao'], os.path.join(temp_dir, 'PREVISAO.xlsx')):
             arquivos_gerados['Outros/PREVISAO.xlsx'] = os.path.join(temp_dir, 'PREVISAO.xlsx')

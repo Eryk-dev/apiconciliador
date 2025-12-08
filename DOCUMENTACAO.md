@@ -1,6 +1,6 @@
 # Super Conciliador API
 
-**Versão:** 2.0.0
+**Versão:** 2.5.1
 **Porta:** 1909
 **Tecnologia:** FastAPI + Python 3.11
 
@@ -20,6 +20,8 @@
 10. [Exemplos de Uso](#exemplos-de-uso)
 11. [API V2 - Melhorias](#api-v2---melhorias)
 12. [API V2.4 - Correção de Divergência de Frete](#api-v24---correção-de-divergência-de-frete)
+13. [API V2.5 - Correção de Valores Consolidados](#api-v25---correção-de-valores-consolidados)
+14. [API V2.5.1 - Validação de Divergências e Log](#api-v251---validação-de-divergências-e-log)
 
 ---
 
@@ -861,7 +863,7 @@ Para detalhes completos sobre o fluxo financeiro do Mercado Livre e o mapeamento
 ## Contato e Suporte
 
 - **Repositório:** https://github.com/Eryk-dev/apiconciliador
-- **Versão:** 2.4.0
+- **Versão:** 2.5.1
 
 ---
 
@@ -945,3 +947,230 @@ else:
 | `detalhar_liberacao_payment()` | Adicionada lógica `frete_ja_considerado` |
 | `detalhar_transacao_assertiva()` | Mesma lógica para IDs múltiplos |
 | Processamento de reembolsos | Removido detalhamento, usa valor direto |
+
+---
+
+## API V2.5 - Correção de Valores Consolidados
+
+A versão 2.5 corrige uma diferença de **R$ 158,34** causada por IDs com valores consolidados no extrato.
+
+### Problema Identificado
+
+Em alguns casos, um ID aparece **apenas 1 vez no EXTRATO** com valor já consolidado (payment - refund), mas tem **múltiplos registros no LIBERAÇÕES** (payment + refund separados).
+
+**Exemplo do problema:**
+
+| ID | EXTRATO | LIBERAÇÕES payment | LIBERAÇÕES refund | Sistema gerava |
+|---|---------|-------------------|-------------------|----------------|
+| 131612176035 | R$ 18,33 | R$ 98,35 | R$ -80,02 | R$ 98,35 ❌ |
+| 133238331847 | R$ 78,32 | R$ 156,64 | R$ -78,32 | R$ 108,76 ❌ |
+
+O sistema verificava se o ID era múltiplo **no EXTRATO**, mas não verificava se tinha múltiplos registros **no LIBERAÇÕES**.
+
+### Solução Implementada
+
+#### 1. Nova Função: `calcular_soma_liberacoes()`
+
+```python
+def calcular_soma_liberacoes(op_id: str) -> float:
+    """
+    Calcula a soma de todos os NET_AMOUNT para um ID no LIBERAÇÕES.
+    Útil para verificar se o extrato mostra um valor consolidado
+    (payment - refund) quando o ID aparece apenas 1 vez no extrato.
+    """
+    if op_id not in map_liberacoes:
+        return 0.0
+    soma = 0.0
+    for desc, dados in map_liberacoes[op_id].items():
+        if isinstance(dados, list):
+            for d in dados:
+                soma += d.get('net_amount', 0)
+        else:
+            soma += dados.get('net_amount', 0)
+    return soma
+```
+
+#### 2. Verificação de Valor Consolidado
+
+Antes de detalhar uma "Liberação de dinheiro", o sistema agora:
+
+1. Verifica se o ID tem `refund`, `chargeback` ou `mediation` no LIBERAÇÕES
+2. Se sim, calcula a soma de todos os NET_AMOUNT do LIBERAÇÕES
+3. Compara com o valor do extrato:
+   - Se **baterem** (diferença < R$ 0,10): Usa valor direto do extrato (consolidado)
+   - Se **não baterem**: Continua com detalhamento normal
+
+```python
+if is_liberacao and has_payment_data:
+    tipos_lib = list(map_liberacoes.get(op_id, {}).keys())
+    tem_refund_lib = any(t in tipos_lib for t in ['refund', 'chargeback', 'mediation'])
+
+    if tem_refund_lib and not is_id_multiplo:
+        soma_lib = calcular_soma_liberacoes(op_id)
+        if abs(val - soma_lib) < 0.10:  # Valor consolidado
+            rows_conta_azul_confirmados.append(criar_lancamento(...))
+            continue
+```
+
+#### 3. Validação em `detalhar_transacao_assertiva()`
+
+Adicionada validação para garantir que a soma dos lançamentos bata com o valor do extrato:
+
+```python
+soma_lancamentos = sum(l['Valor'] for l in lancamentos)
+if abs(soma_lancamentos - valor_extrato) > 0.10:
+    logger.info(f"op_id={op_id}: soma lançamentos != extrato, usando fallback")
+    return []  # Usar valor direto do extrato
+```
+
+### IDs Corrigidos
+
+| ID | Antes (V2.4) | Depois (V2.5) | Extrato |
+|---|--------------|---------------|---------|
+| 131612176035 | R$ 98,35 | R$ 18,33 | R$ 18,33 ✓ |
+| 133846835944 | R$ 242,40 | R$ 194,52 | R$ 194,52 ✓ |
+| 133238331847 | R$ 108,76 | R$ 78,32 | R$ 78,32 ✓ |
+
+### Resultado
+
+| Métrica | Antes (V2.4) | Depois (V2.5) |
+|---------|--------------|---------------|
+| Diferença total | R$ 158,34 | **R$ 0,00** |
+| IDs divergentes | 3 | **0** |
+
+### Funções Modificadas
+
+| Função | Modificação |
+|--------|-------------|
+| `calcular_soma_liberacoes()` | **NOVA** - Calcula soma de todos NET_AMOUNT |
+| Bloco de processamento (~linha 986) | Verificação de valor consolidado antes de detalhar |
+| `detalhar_transacao_assertiva()` | Validação de soma = valor extrato |
+
+---
+
+## API V2.5.1 - Validação de Divergências e Log
+
+A versão 2.5.1 adiciona uma **validação final** em `detalhar_liberacao_payment()` que garante que o valor calculado sempre bata com o EXTRATO, e gera um **arquivo de log** para conferência de divergências.
+
+### Problema Identificado
+
+Em alguns casos específicos, mesmo após todas as validações anteriores, o valor calculado (receita + comissão + frete) não batia com o valor do EXTRATO. Isso ocorria principalmente quando:
+
+1. O ID **não existia no LIBERAÇÕES** (sistema usava dados do VENDAS)
+2. Os dados do **VENDAS tinham valores diferentes** do EXTRATO
+3. Houve **ajustes manuais** no Mercado Livre que não refletiram nos relatórios
+
+**Exemplo real (ID: 131348251129):**
+```
+EXTRATO:     R$ 55,72
+VENDAS:      R$ 69,19 (net_received)
+LIBERAÇÕES:  (não encontrado)
+Diferença:   R$ 13,47
+```
+
+### Solução Implementada
+
+#### 1. Validação Final em `detalhar_liberacao_payment()`
+
+Após gerar os lançamentos detalhados, o sistema compara a soma com o valor do EXTRATO:
+
+```python
+# V2.5.1: VALIDAÇÃO FINAL
+soma_lancamentos = sum(l['Valor'] for l in lancamentos)
+if abs(soma_lancamentos - valor_extrato) > 0.10:
+    # Divergência detectada!
+    # Registrar no log e usar valor direto do EXTRATO
+    rows_divergencias_fallback.append({
+        'ID': op_id,
+        'Data': data_str,
+        'Tipo': 'Liberação de dinheiro',
+        'Valor_Extrato': valor_extrato,
+        'Valor_Calculado': soma_lancamentos,
+        'Valor_Vendas': valor_esperado_vendas,
+        'Diferenca': round(soma_lancamentos - valor_extrato, 2),
+        'Fonte_Original': 'VENDAS' if op_id not in map_liberacoes else 'LIBERACOES',
+        'Observacao': 'Usado valor direto do EXTRATO por divergência'
+    })
+
+    # Usar valor do EXTRATO ao invés do calculado
+    lancamentos = [criar_lancamento(
+        op_id, data_str,
+        get_categoria_receita(op_id),
+        valor_extrato,
+        descricao_base,
+        "Liberação de venda (ajustado - ver DIVERGENCIAS)"
+    )]
+```
+
+#### 2. Novo Arquivo de Saída: `DIVERGENCIAS_FALLBACK.csv`
+
+Quando há divergências, o sistema gera um arquivo CSV para conferência no final do mês:
+
+| Coluna | Descrição |
+|--------|-----------|
+| ID | ID da operação |
+| Data | Data da transação |
+| Tipo | Tipo da transação (ex: "Liberação de dinheiro") |
+| Valor_Extrato | Valor que aparece no EXTRATO (fonte de verdade) |
+| Valor_Calculado | Valor que o sistema calculou |
+| Valor_Vendas | Valor do net_received no VENDAS |
+| Diferenca | Diferença entre calculado e extrato |
+| Fonte_Original | De onde o sistema pegou os dados (VENDAS ou LIBERACOES) |
+| Observacao | Nota sobre o que foi feito |
+
+**Exemplo de conteúdo:**
+```csv
+ID;Data;Tipo;Valor_Extrato;Valor_Calculado;Valor_Vendas;Diferenca;Fonte_Original;Observacao
+131348251129;09/11/2025;Liberação de dinheiro;55.72;69.19;69.19;13.47;VENDAS;Usado valor direto do EXTRATO por divergência
+```
+
+### Garantia de 100% de Precisão
+
+Com esta validação:
+
+1. **Soma total SEMPRE bate com EXTRATO** (diferença < R$ 0,10)
+2. **Divergências são logadas** para conferência manual
+3. **EXTRATO é a fonte de verdade** - prevalece sobre VENDAS/LIBERAÇÕES
+
+### Arquivos de Saída Atualizados
+
+| Arquivo | Descrição |
+|---------|-----------|
+| `IMPORTACAO_CONTA_AZUL_CONFIRMADOS.csv` | Lançamentos já realizados |
+| `IMPORTACAO_CONTA_AZUL_PREVISAO.csv` | Lançamentos pendentes |
+| `PAGAMENTO_CONTAS.csv` | Pagamentos via MP |
+| `TRANSFERENCIAS.csv` | PIX e transferências |
+| **`DIVERGENCIAS_FALLBACK.csv`** | **NOVO** - IDs com divergência que usaram fallback |
+
+### Resultado dos Testes
+
+| Teste | Diferença | Divergências | Observação |
+|-------|-----------|--------------|------------|
+| Eaypeasy | R$ 0,00 | 1 | Divergência logada para conferência |
+| Netparts | R$ 0,00 | 0 | Todos os valores bateram |
+| Bellator | R$ 0,00 | 130 | LIBERAÇÕES com formato incorreto |
+
+### Funções Modificadas
+
+| Função | Modificação |
+|--------|-------------|
+| `detalhar_liberacao_payment()` | Adicionada validação final e fallback |
+| `processar_conciliacao()` | Adicionado `rows_divergencias_fallback` ao retorno |
+| Geração de ZIP | Adicionada geração do `DIVERGENCIAS_FALLBACK.csv` |
+
+### Quando Verificar o Arquivo de Divergências
+
+O arquivo `DIVERGENCIAS_FALLBACK.csv` deve ser verificado quando:
+
+1. **Final do mês** - Conferir se os valores fazem sentido
+2. **Muitas divergências** - Pode indicar problema no relatório de entrada
+3. **Valores altos** - Divergências significativas merecem investigação
+
+### Possíveis Causas de Divergência
+
+| Causa | Sintoma | Ação |
+|-------|---------|------|
+| ID não existe no LIBERAÇÕES | Fonte = "VENDAS" | Normal para vendas muito recentes |
+| Relatório LIBERAÇÕES com formato errado | Muitas divergências | Verificar colunas do CSV |
+| Ajuste manual do ML | Valor diferente | Conferir no painel do ML |
+| Parcelamento não liberado | VENDAS > EXTRATO | Normal, conferir liberações futuras |

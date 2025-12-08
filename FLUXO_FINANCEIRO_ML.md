@@ -959,5 +959,138 @@ Reembolsos **NÃO devem ser detalhados**. O EXTRATO já mostra o valor líquido 
 
 ---
 
+## 14. Validação de Divergências e Log (V2.5.1)
+
+### 14.1 O Problema das Divergências Residuais
+
+Mesmo com todas as validações anteriores (V2.4 e V2.5), em alguns casos o valor calculado ainda divergia do EXTRATO. Isso acontece quando:
+
+1. **ID não existe no LIBERAÇÕES** - Sistema usa VENDAS como fallback
+2. **VENDAS tem valores diferentes** do EXTRATO
+3. **Ajustes manuais do ML** que não refletem nos relatórios
+
+### 14.2 Solução: Validação Final com Fallback
+
+A V2.5.1 adiciona uma **última linha de defesa** na função `detalhar_liberacao_payment()`:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    VALIDAÇÃO FINAL V2.5.1                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. Calcular soma de todos os lançamentos gerados               │
+│                                                                 │
+│  2. Comparar com valor do EXTRATO:                              │
+│     └── SE |soma - extrato| > R$ 0,10:                          │
+│         ├── Registrar divergência no log                        │
+│         └── Usar valor do EXTRATO (fallback)                    │
+│                                                                 │
+│  3. RESULTADO: Soma SEMPRE = EXTRATO (garantido)                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 14.3 Arquivo de Log: DIVERGENCIAS_FALLBACK.csv
+
+Quando há divergências, o sistema gera um arquivo para conferência:
+
+```
+DIVERGENCIAS_FALLBACK.csv
+├── ID                  → ID da operação
+├── Data                → Data da transação
+├── Tipo                → "Liberação de dinheiro"
+├── Valor_Extrato       → Valor real do EXTRATO
+├── Valor_Calculado     → Valor que o sistema calculou
+├── Valor_Vendas        → net_received do VENDAS
+├── Diferenca           → Calculado - Extrato
+├── Fonte_Original      → "VENDAS" ou "LIBERACOES"
+└── Observacao          → Nota sobre a ação tomada
+```
+
+### 14.4 Exemplo de Divergência
+
+```
+ID: 131348251129
+
+Fontes de dados:
+  EXTRATO:     R$ 55,72    ← FONTE DE VERDADE
+  VENDAS:      R$ 69,19    (net_received)
+  LIBERAÇÕES:  (não encontrado)
+
+Sistema calculou:
+  Receita = 69,19 (do VENDAS)
+  SOMA = R$ 69,19
+
+Validação:
+  |69,19 - 55,72| = 13,47 > 0,10  → DIVERGÊNCIA!
+
+Ação V2.5.1:
+  1. Registrar no DIVERGENCIAS_FALLBACK.csv
+  2. Usar valor do EXTRATO: R$ 55,72
+  3. Lançamento gerado: Receita = R$ 55,72
+
+Resultado:
+  Soma dos lançamentos = Extrato ✓
+```
+
+### 14.5 Fluxo Completo de Processamento
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PROCESSAMENTO V2.5.1                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  EXTRATO (linha por linha)                                      │
+│       │                                                         │
+│       ▼                                                         │
+│  "Liberação de dinheiro"?                                       │
+│       │                                                         │
+│       ├── SIM → Verificar LIBERAÇÕES                            │
+│       │         │                                               │
+│       │         ├── Tem payment+refund (consolidado)?           │
+│       │         │   └── V2.5: Usar valor direto                 │
+│       │         │                                               │
+│       │         ├── Tem dados no LIBERAÇÕES?                    │
+│       │         │   └── Detalhar (receita + comissão + frete)   │
+│       │         │                                               │
+│       │         └── Não tem dados?                              │
+│       │             └── Usar VENDAS como fallback               │
+│       │                                                         │
+│       │         │                                               │
+│       │         ▼                                               │
+│       │  ┌─────────────────────────────────────┐                │
+│       │  │  V2.5.1: VALIDAÇÃO FINAL            │                │
+│       │  │                                     │                │
+│       │  │  soma = sum(lançamentos)            │                │
+│       │  │  SE |soma - extrato| > 0.10:        │                │
+│       │  │    → Logar divergência              │                │
+│       │  │    → Usar valor do extrato          │                │
+│       │  │                                     │                │
+│       │  │  RESULTADO: soma == extrato ✓       │                │
+│       │  └─────────────────────────────────────┘                │
+│       │                                                         │
+│       └── NÃO → Processar outros tipos (reembolso, etc.)        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 14.6 Quando Investigar Divergências
+
+| Situação | Ação Recomendada |
+|----------|------------------|
+| 0 divergências | Perfeito, nada a fazer |
+| 1-5 divergências | Conferir no final do mês |
+| 10+ divergências | Verificar formato do LIBERAÇÕES |
+| 100+ divergências | Provável problema no relatório de entrada |
+
+### 14.7 Causas Comuns de Divergência
+
+1. **Vendas muito recentes** - Ainda não apareceram no LIBERAÇÕES
+2. **Parcelamentos** - VENDAS mostra valor total, EXTRATO mostra parcial
+3. **Ajustes ML** - Descontos ou bônus aplicados manualmente
+4. **Formato CSV errado** - LIBERAÇÕES com colunas incorretas
+
+---
+
 *Documento criado em: Novembro 2025*
-*Versão: 1.5 - Adicionada lógica avançada de frete (V2.4)*
+*Versão: 1.6 - Adicionada validação de divergências e log (V2.5.1)*
