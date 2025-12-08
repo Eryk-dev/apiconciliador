@@ -1,5 +1,10 @@
 """
-API do Super Conciliador V2.5.1 - Mercado Livre -> Conta Azul
+API do Super Conciliador V2.6.0 - Mercado Livre -> Conta Azul
+
+VERSÃO 2.6.0 (2025-12-08):
+- MELHORIA: Todos os relatórios agora são opcionais, exceto o EXTRATO
+- Permite rodar conciliação mesmo sem pós-venda, vendas, liberações ou dinheiro
+- Útil para contas que não tiveram certas movimentações no período
 
 VERSÃO 2.5.1 (2025-12-08):
 - CORREÇÃO: Validação em detalhar_liberacao_payment() - se soma divergir do extrato,
@@ -1547,11 +1552,11 @@ async def root():
 
 @app.post("/conciliar")
 async def conciliar(
-    dinheiro: UploadFile = File(..., description="Arquivo settlement (dinheiro em conta) - CSV ou ZIP"),
-    vendas: UploadFile = File(..., description="Arquivo collection (vendas) - CSV ou ZIP"),
-    pos_venda: UploadFile = File(..., description="Arquivo after_collection (pós venda) - CSV ou ZIP"),
-    liberacoes: UploadFile = File(..., description="Arquivo reserve-release (liberações) - CSV ou ZIP"),
-    extrato: UploadFile = File(..., description="Arquivo account_statement (extrato) - CSV ou ZIP"),
+    dinheiro: Optional[UploadFile] = File(None, description="Arquivo settlement (dinheiro em conta) - CSV ou ZIP"),
+    vendas: Optional[UploadFile] = File(None, description="Arquivo collection (vendas) - CSV ou ZIP"),
+    pos_venda: Optional[UploadFile] = File(None, description="Arquivo after_collection (pós venda) - CSV ou ZIP"),
+    liberacoes: Optional[UploadFile] = File(None, description="Arquivo reserve-release (liberações) - CSV ou ZIP"),
+    extrato: UploadFile = File(..., description="Arquivo account_statement (extrato) - CSV ou ZIP - OBRIGATÓRIO"),
     retirada: Optional[UploadFile] = File(None, description="Arquivo withdraw (retirada) - opcional - CSV ou ZIP"),
     centro_custo: str = Form("NETAIR", description="Centro de custo para os lançamentos")
 ):
@@ -1563,12 +1568,15 @@ async def conciliar(
     Quando um ZIP é enviado, todos os CSVs dentro dele são extraídos e concatenados automaticamente.
     Isso é útil para períodos longos que geram múltiplos arquivos compactados.
 
-    - **dinheiro**: settlement report (obrigatório) - CSV ou ZIP
-    - **vendas**: collection report (obrigatório) - CSV ou ZIP
-    - **pos_venda**: after_collection report (obrigatório) - CSV ou ZIP
-    - **liberacoes**: reserve-release report (obrigatório) - CSV ou ZIP
-    - **extrato**: account_statement report (obrigatório) - CSV ou ZIP
+    - **extrato**: account_statement report (OBRIGATÓRIO) - CSV ou ZIP
+    - **dinheiro**: settlement report (opcional) - CSV ou ZIP
+    - **vendas**: collection report (opcional) - CSV ou ZIP
+    - **pos_venda**: after_collection report (opcional) - CSV ou ZIP
+    - **liberacoes**: reserve-release report (opcional) - CSV ou ZIP
     - **retirada**: withdraw report (opcional) - CSV ou ZIP
+
+    NOTA: Apenas o extrato é obrigatório. Os demais relatórios enriquecem os dados mas
+    não são necessários para o processamento básico.
 
     ## Parâmetros adicionais:
     - **centro_custo**: Centro de custo para os lançamentos (padrão: NETAIR)
@@ -1716,37 +1724,54 @@ async def conciliar(
             df = pd.DataFrame(data_rows, columns=header[:expected_cols])
             return df
 
-        # Carregar arquivos obrigatórios
-        try:
-            arquivos['dinheiro'] = await ler_csv(dinheiro, 'dinheiro', clean_json=True)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'dinheiro': {str(e)}")
-
-        try:
-            arquivos['vendas'] = await ler_csv(vendas, 'vendas')
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'vendas': {str(e)}")
-
-        try:
-            arquivos['pos_venda'] = await ler_csv(pos_venda, 'pos_venda')
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'pos_venda': {str(e)}")
-
-        try:
-            arquivos['liberacoes'] = await ler_csv(liberacoes, 'liberacoes', clean_json=True)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'liberacoes': {str(e)}")
-
+        # Carregar extrato (OBRIGATÓRIO)
         try:
             arquivos['extrato'] = await ler_extrato(extrato)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'extrato': {str(e)}")
 
-        # Arquivo opcional
+        # Carregar arquivos opcionais - se não enviados, usar DataFrame vazio
+        if dinheiro:
+            try:
+                arquivos['dinheiro'] = await ler_csv(dinheiro, 'dinheiro', clean_json=True)
+            except Exception as e:
+                logger.warning(f"Erro ao processar 'dinheiro', usando DataFrame vazio: {str(e)}")
+                arquivos['dinheiro'] = pd.DataFrame()
+        else:
+            arquivos['dinheiro'] = pd.DataFrame()
+
+        if vendas:
+            try:
+                arquivos['vendas'] = await ler_csv(vendas, 'vendas')
+            except Exception as e:
+                logger.warning(f"Erro ao processar 'vendas', usando DataFrame vazio: {str(e)}")
+                arquivos['vendas'] = pd.DataFrame()
+        else:
+            arquivos['vendas'] = pd.DataFrame()
+
+        if pos_venda:
+            try:
+                arquivos['pos_venda'] = await ler_csv(pos_venda, 'pos_venda')
+            except Exception as e:
+                logger.warning(f"Erro ao processar 'pos_venda', usando DataFrame vazio: {str(e)}")
+                arquivos['pos_venda'] = pd.DataFrame()
+        else:
+            arquivos['pos_venda'] = pd.DataFrame()
+
+        if liberacoes:
+            try:
+                arquivos['liberacoes'] = await ler_csv(liberacoes, 'liberacoes', clean_json=True)
+            except Exception as e:
+                logger.warning(f"Erro ao processar 'liberacoes', usando DataFrame vazio: {str(e)}")
+                arquivos['liberacoes'] = pd.DataFrame()
+        else:
+            arquivos['liberacoes'] = pd.DataFrame()
+
         if retirada:
             try:
                 arquivos['retirada'] = await ler_csv(retirada, 'retirada')
-            except:
+            except Exception as e:
+                logger.warning(f"Erro ao processar 'retirada', usando DataFrame vazio: {str(e)}")
                 arquivos['retirada'] = pd.DataFrame()
         else:
             arquivos['retirada'] = pd.DataFrame()
