@@ -5,8 +5,8 @@ VERSÃO 2.6.0 (2025-12-09):
 - NOVO: Arquivo OFX (EXTRATO_MERCADOPAGO.ofx) na pasta Conta Azul
 - OFX inclui: confirmados + transferências + pagamentos de contas
 - Formato OFX/Money 2000 (versão 102) compatível com Mercado Pago
-- REMOVIDO: TRANSFERENCIAS.xlsx e PAGAMENTO_CONTAS.xlsx da pasta Conta Azul
-- Pasta Conta Azul agora contém apenas: CONFIRMADOS.xlsx + EXTRATO_MERCADOPAGO.ofx
+- MOVIDO: TRANSFERENCIAS.xlsx e PAGAMENTO_CONTAS.xlsx para pasta Outros
+- Pasta Conta Azul agora contém: CONFIRMADOS.xlsx + EXTRATO_MERCADOPAGO.ofx
 
 VERSÃO 2.5.1 (2025-12-08):
 - CORREÇÃO: Validação em detalhar_liberacao_payment() - se soma divergir do extrato,
@@ -1958,6 +1958,12 @@ async def conciliar(
 
         if gerar_xlsx_completo(resultado['previsao'], os.path.join(temp_dir, 'PREVISAO.xlsx')):
             arquivos_gerados['Outros/PREVISAO.xlsx'] = os.path.join(temp_dir, 'PREVISAO.xlsx')
+
+        if gerar_xlsx_completo(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')):
+            arquivos_gerados['Outros/TRANSFERENCIAS.xlsx'] = os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')
+
+        if gerar_xlsx_completo(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')):
+            arquivos_gerados['Outros/PAGAMENTO_CONTAS.xlsx'] = os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')
 
         if not arquivos_gerados:
             raise HTTPException(status_code=500, detail="Nenhum arquivo foi gerado. Verifique os dados de entrada.")
