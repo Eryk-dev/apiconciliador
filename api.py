@@ -1,5 +1,12 @@
 """
-API do Super Conciliador V2.5.1 - Mercado Livre -> Conta Azul
+API do Super Conciliador V2.6.0 - Mercado Livre -> Conta Azul
+
+VERSÃO 2.6.0 (2025-12-09):
+- NOVO: Arquivo OFX (EXTRATO_MERCADOPAGO.ofx) na pasta Conta Azul
+- OFX inclui: confirmados + transferências + pagamentos de contas
+- Formato OFX/Money 2000 (versão 102) compatível com Mercado Pago
+- REMOVIDO: TRANSFERENCIAS.xlsx e PAGAMENTO_CONTAS.xlsx da pasta Conta Azul
+- Pasta Conta Azul agora contém apenas: CONFIRMADOS.xlsx + EXTRATO_MERCADOPAGO.ofx
 
 VERSÃO 2.5.1 (2025-12-08):
 - CORREÇÃO: Validação em detalhar_liberacao_payment() - se soma divergir do extrato,
@@ -1467,6 +1474,141 @@ def gerar_xlsx_completo(rows: List[Dict], output_path: str) -> bool:
     return True
 
 
+def gerar_ofx_mercadopago(rows: List[Dict], output_path: str) -> bool:
+    """
+    Gera arquivo OFX no formato Money 2000 (versão 102) compatível com Mercado Pago.
+
+    Args:
+        rows: Lista de dicionários com as transações
+        output_path: Caminho para salvar o arquivo OFX
+
+    Returns:
+        True se o arquivo foi gerado com sucesso, False caso contrário
+    """
+    import hashlib
+
+    if not rows:
+        return False
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return False
+
+    df['Valor'] = df['Valor'].round(2)
+    df = df[df['Valor'] != 0]
+
+    if df.empty:
+        return False
+
+    # Determinar período das transações
+    datas = pd.to_datetime(df['Data de Pagamento'], format='%d/%m/%Y', errors='coerce')
+    data_inicio = datas.min()
+    data_fim = datas.max()
+
+    if pd.isna(data_inicio) or pd.isna(data_fim):
+        return False
+
+    dt_start = data_inicio.strftime('%Y%m%d') + '000000'
+    dt_end = data_fim.strftime('%Y%m%d') + '235959'
+    dt_server = datetime.now().strftime('%Y%m%d%H%M%S')
+
+    # Cabeçalho OFX - identificadores do Mercado Pago
+    ofx = f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEUID:NONE
+NEWFILEUID:NONE
+
+<OFX>
+<SIGNONMSGSRSV1>
+<SONRS>
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<DTSERVER>{dt_server}
+<LANGUAGE>POR
+<FI>
+<ORG>Mercado Pago
+<FID>10573
+</FI>
+</SONRS>
+</SIGNONMSGSRSV1>
+<BANKMSGSRSV1>
+<STMTTRNRS>
+<TRNUID>1
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<STMTRS>
+<CURDEF>BRL
+<BANKACCTFROM>
+<BANKID>10573
+<ACCTID>MERCADOPAGO
+<ACCTTYPE>CHECKING
+</BANKACCTFROM>
+<BANKTRANLIST>
+<DTSTART>{dt_start}
+<DTEND>{dt_end}
+"""
+
+    # Transações
+    for idx, row in df.iterrows():
+        valor = row['Valor']
+        descricao = str(row.get('Descrição', ''))[:255]
+        data_pag = row.get('Data de Pagamento', '')
+
+        # Converter data para formato OFX
+        try:
+            dt_posted = datetime.strptime(data_pag, '%d/%m/%Y').strftime('%Y%m%d')
+        except:
+            dt_posted = datetime.now().strftime('%Y%m%d')
+
+        # Tipo: CREDIT para positivo, DEBIT para negativo
+        trntype = 'CREDIT' if valor >= 0 else 'DEBIT'
+
+        # Gera um ID único baseado na descrição, valor e índice
+        fitid = hashlib.md5(f"{descricao}{valor}{idx}".encode()).hexdigest()[:20]
+
+        # Limpar caracteres especiais do memo
+        memo = descricao.replace('&', 'e').replace('<', '').replace('>', '').replace('"', '')
+
+        ofx += f"""<STMTTRN>
+<TRNTYPE>{trntype}
+<DTPOSTED>{dt_posted}
+<TRNAMT>{valor:.2f}
+<FITID>{fitid}
+<MEMO>{memo}
+</STMTTRN>
+"""
+
+    # Saldo final
+    saldo = df['Valor'].sum()
+    dt_asof = data_fim.strftime('%Y%m%d')
+
+    ofx += f"""</BANKTRANLIST>
+<LEDGERBAL>
+<BALAMT>{saldo:.2f}
+<DTASOF>{dt_asof}
+</LEDGERBAL>
+</STMTRS>
+</STMTTRNRS>
+</BANKMSGSRSV1>
+</OFX>
+"""
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(ofx)
+
+    return True
+
+
 def gerar_xlsx_resumo(rows: List[Dict], output_path: str) -> bool:
     """Gera arquivo XLSX com dados agrupados por Data de Pagamento e Categoria"""
     if not rows:
@@ -1766,16 +1908,15 @@ async def conciliar(
         arquivos_gerados = {}  # {caminho_no_zip: caminho_local}
 
         # =====================================================================
-        # PASTA: Conta Azul (arquivos XLSX principais para importação)
+        # PASTA: Conta Azul (CONFIRMADOS.xlsx + OFX completo)
         # =====================================================================
         if gerar_xlsx_completo(resultado['confirmados'], os.path.join(temp_dir, 'CONFIRMADOS.xlsx')):
             arquivos_gerados['Conta Azul/CONFIRMADOS.xlsx'] = os.path.join(temp_dir, 'CONFIRMADOS.xlsx')
 
-        if gerar_xlsx_completo(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')):
-            arquivos_gerados['Conta Azul/TRANSFERENCIAS.xlsx'] = os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')
-
-        if gerar_xlsx_completo(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')):
-            arquivos_gerados['Conta Azul/PAGAMENTO_CONTAS.xlsx'] = os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')
+        # Gerar OFX completo (confirmados + transferencias + pagamentos)
+        todas_transacoes = resultado['confirmados'] + resultado['transferencias'] + resultado['pagamentos']
+        if gerar_ofx_mercadopago(todas_transacoes, os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx')):
+            arquivos_gerados['Conta Azul/EXTRATO_MERCADOPAGO.ofx'] = os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx')
 
         # =====================================================================
         # PASTA: Resumo (arquivos agrupados por data/categoria)
