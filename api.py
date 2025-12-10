@@ -2068,20 +2068,22 @@ async def conciliar(
         # Estrutura:
         #   Conta Azul/  - Arquivos principais para importação
         #   Resumo/      - Arquivos resumidos (agrupados por data/categoria)
-        #   Outros/      - CSVs e arquivos auxiliares
+        #   Outros/      - CSVs, OFX e arquivos auxiliares
 
         arquivos_gerados = {}  # {caminho_no_zip: caminho_local}
 
         # =====================================================================
-        # PASTA: Conta Azul (CONFIRMADOS.xlsx + OFX completo)
+        # PASTA: Conta Azul (arquivos principais para importação)
         # =====================================================================
         if gerar_xlsx_completo(resultado['confirmados'], os.path.join(temp_dir, 'CONFIRMADOS.xlsx')):
             arquivos_gerados['Conta Azul/CONFIRMADOS.xlsx'] = os.path.join(temp_dir, 'CONFIRMADOS.xlsx')
 
-        # Gerar OFX completo (confirmados + transferencias + pagamentos) com saldo inicial
-        todas_transacoes = resultado['confirmados'] + resultado['transferencias'] + resultado['pagamentos']
-        if gerar_ofx_mercadopago(todas_transacoes, os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx'), saldo_inicial_extrato):
-            arquivos_gerados['Conta Azul/EXTRATO_MERCADOPAGO.ofx'] = os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx')
+        # XLSX de transferências e pagamentos voltam para a pasta principal
+        if gerar_xlsx_completo(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')):
+            arquivos_gerados['Conta Azul/TRANSFERENCIAS.xlsx'] = os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')
+
+        if gerar_xlsx_completo(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')):
+            arquivos_gerados['Conta Azul/PAGAMENTO_CONTAS.xlsx'] = os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')
 
         # =====================================================================
         # PASTA: Resumo (arquivos agrupados por data/categoria)
@@ -2124,11 +2126,10 @@ async def conciliar(
         if gerar_xlsx_completo(resultado['previsao'], os.path.join(temp_dir, 'PREVISAO.xlsx')):
             arquivos_gerados['Outros/PREVISAO.xlsx'] = os.path.join(temp_dir, 'PREVISAO.xlsx')
 
-        if gerar_xlsx_completo(resultado['transferencias'], os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')):
-            arquivos_gerados['Outros/TRANSFERENCIAS.xlsx'] = os.path.join(temp_dir, 'TRANSFERENCIAS.xlsx')
-
-        if gerar_xlsx_completo(resultado['pagamentos'], os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')):
-            arquivos_gerados['Outros/PAGAMENTO_CONTAS.xlsx'] = os.path.join(temp_dir, 'PAGAMENTO_CONTAS.xlsx')
+        # Gerar OFX completo (confirmados + transferencias + pagamentos) com saldo inicial
+        todas_transacoes = resultado['confirmados'] + resultado['transferencias'] + resultado['pagamentos']
+        if gerar_ofx_mercadopago(todas_transacoes, os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx'), saldo_inicial_extrato):
+            arquivos_gerados['Outros/EXTRATO_MERCADOPAGO.ofx'] = os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx')
 
         if not arquivos_gerados:
             raise HTTPException(status_code=500, detail="Nenhum arquivo foi gerado. Verifique os dados de entrada.")

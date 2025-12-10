@@ -289,6 +289,15 @@ O endpoint `/conciliar` retorna um arquivo ZIP contendo:
 | `PAGAMENTO_CONTAS.xlsx` | Pagamentos feitos via MP (Excel) |
 | `TRANSFERENCIAS.csv` | PIX e transferências (CSV) |
 | `TRANSFERENCIAS.xlsx` | PIX e transferências (Excel) |
+| `EXTRATO_MERCADOPAGO.ofx` | Extrato consolidado para importação bancária |
+
+### Estrutura do ZIP
+
+| Pasta | Conteúdo |
+|-------|----------|
+| `Conta Azul/` | `CONFIRMADOS.xlsx`, `TRANSFERENCIAS.xlsx`, `PAGAMENTO_CONTAS.xlsx` |
+| `Resumo/` | Arquivos *_RESUMO.xlsx (confirmados, previsão, transferências, pagamentos) |
+| `Outros/` | CSVs, `PREVISAO.xlsx`, `EXTRATO_MERCADOPAGO.ofx`, `DIVERGENCIAS_FALLBACK.csv` (quando existir) |
 
 ### Estrutura dos Arquivos de Saída
 
@@ -1182,7 +1191,7 @@ O arquivo `DIVERGENCIAS_FALLBACK.csv` deve ser verificado quando:
 ## API V2.6.0 - Exportação OFX
 
 ### O que mudou
-- Geramos `EXTRATO_MERCADOPAGO.ofx` na pasta Conta Azul para importação bancária.
+- Geramos `EXTRATO_MERCADOPAGO.ofx` na pasta **Outros** para importação bancária.
 - O OFX soma **confirmados + transferências + pagamentos** e considera o `INITIAL_BALANCE` do extrato; saldo final = saldo inicial + transações.
 
 ### Detalhes
