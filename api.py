@@ -221,12 +221,13 @@ def format_date(val) -> str:
     try:
         if isinstance(val, str):
             # Tenta parsear diferentes formatos
+            # IMPORTANTE: dayfirst=True para formato brasileiro (dd/mm/yyyy)
             for fmt in ['%Y-%m-%d', '%d/%m/%Y', '%Y-%m-%d %H:%M:%S']:
                 try:
-                    return pd.to_datetime(val).strftime('%d/%m/%Y')
+                    return pd.to_datetime(val, dayfirst=True).strftime('%d/%m/%Y')
                 except:
                     continue
-        return pd.to_datetime(val).strftime('%d/%m/%Y')
+        return pd.to_datetime(val, dayfirst=True).strftime('%d/%m/%Y')
     except:
         return ""
 
