@@ -1,5 +1,9 @@
 """
-API do Super Conciliador V2.6.0 - Mercado Livre -> Conta Azul
+API do Super Conciliador V2.6.1 - Mercado Livre -> Conta Azul
+
+VERSÃO 2.6.1 (2025-12-09):
+- CORREÇÃO: OFX agora considera o saldo inicial (INITIAL_BALANCE) do extrato
+- Saldo final do OFX = saldo inicial + soma das transações
 
 VERSÃO 2.6.0 (2025-12-09):
 - NOVO: Arquivo OFX (EXTRATO_MERCADOPAGO.ofx) na pasta Conta Azul
@@ -1474,13 +1478,14 @@ def gerar_xlsx_completo(rows: List[Dict], output_path: str) -> bool:
     return True
 
 
-def gerar_ofx_mercadopago(rows: List[Dict], output_path: str) -> bool:
+def gerar_ofx_mercadopago(rows: List[Dict], output_path: str, saldo_inicial: float = 0.0) -> bool:
     """
     Gera arquivo OFX no formato Money 2000 (versão 102) compatível com Mercado Pago.
 
     Args:
         rows: Lista de dicionários com as transações
         output_path: Caminho para salvar o arquivo OFX
+        saldo_inicial: Saldo inicial do extrato (INITIAL_BALANCE)
 
     Returns:
         True se o arquivo foi gerado com sucesso, False caso contrário
@@ -1588,13 +1593,13 @@ NEWFILEUID:NONE
 </STMTTRN>
 """
 
-    # Saldo final
-    saldo = df['Valor'].sum()
+    # Saldo final = saldo inicial + soma das transações
+    saldo_final = saldo_inicial + df['Valor'].sum()
     dt_asof = data_fim.strftime('%Y%m%d')
 
     ofx += f"""</BANKTRANLIST>
 <LEDGERBAL>
-<BALAMT>{saldo:.2f}
+<BALAMT>{saldo_final:.2f}
 <DTASOF>{dt_asof}
 </LEDGERBAL>
 </STMTRS>
@@ -1780,7 +1785,7 @@ async def conciliar(
                 index_col=False
             )
 
-        async def ler_extrato(upload_file: UploadFile):
+        async def ler_extrato(upload_file: UploadFile) -> Tuple[pd.DataFrame, float]:
             """
             Lê o arquivo de extrato (account_statement) com tratamento especial para
             linhas que têm campos extras devido a separadores no nome da empresa.
@@ -1790,14 +1795,17 @@ async def conciliar(
 
             Quando o TRANSACTION_TYPE contém ';', a linha fica com mais de 5 campos.
             Esta função junta os campos extras no TRANSACTION_TYPE.
+
+            Returns:
+                Tuple[DataFrame, float]: (DataFrame com transações, saldo_inicial)
             """
             content = await upload_file.read()
 
             # Verificar se é ZIP
             if is_zip_file(content):
                 logger.info("Arquivo 'extrato' detectado como ZIP - extraindo e concatenando CSVs...")
-                # Para ZIP, usar tratamento padrão por enquanto
-                return extrair_csvs_do_zip(content, skip_rows=3, clean_json=False)
+                # Para ZIP, usar tratamento padrão por enquanto (sem saldo inicial)
+                return extrair_csvs_do_zip(content, skip_rows=3, clean_json=False), 0.0
 
             content_str = content.decode('utf-8')
             lines = content_str.split('\n')
@@ -1810,6 +1818,18 @@ async def conciliar(
 
             if len(lines) < 4:
                 raise ValueError("Arquivo de extrato inválido - menos de 4 linhas")
+
+            # Extrair saldo inicial da linha 1
+            saldo_inicial = 0.0
+            try:
+                valores_resumo = lines[1].strip().split(';')
+                if valores_resumo:
+                    # INITIAL_BALANCE está na primeira posição
+                    saldo_str = valores_resumo[0].replace('.', '').replace(',', '.')
+                    saldo_inicial = float(saldo_str)
+                    logger.info(f"Extrato: Saldo inicial = R$ {saldo_inicial:.2f}")
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Extrato: Não foi possível extrair saldo inicial: {e}")
 
             header = lines[3].strip().split(';')
             expected_cols = 5  # RELEASE_DATE, TRANSACTION_TYPE, REFERENCE_ID, TRANSACTION_NET_AMOUNT, PARTIAL_BALANCE
@@ -1856,7 +1876,7 @@ async def conciliar(
                 logger.info(f"Extrato: {linhas_corrigidas} linha(s) com campos extras foram corrigidas")
 
             df = pd.DataFrame(data_rows, columns=header[:expected_cols])
-            return df
+            return df, saldo_inicial
 
         # Carregar arquivos obrigatórios
         try:
@@ -1880,7 +1900,7 @@ async def conciliar(
             raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'liberacoes': {str(e)}")
 
         try:
-            arquivos['extrato'] = await ler_extrato(extrato)
+            arquivos['extrato'], saldo_inicial_extrato = await ler_extrato(extrato)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erro ao processar arquivo 'extrato': {str(e)}")
 
@@ -1913,9 +1933,9 @@ async def conciliar(
         if gerar_xlsx_completo(resultado['confirmados'], os.path.join(temp_dir, 'CONFIRMADOS.xlsx')):
             arquivos_gerados['Conta Azul/CONFIRMADOS.xlsx'] = os.path.join(temp_dir, 'CONFIRMADOS.xlsx')
 
-        # Gerar OFX completo (confirmados + transferencias + pagamentos)
+        # Gerar OFX completo (confirmados + transferencias + pagamentos) com saldo inicial
         todas_transacoes = resultado['confirmados'] + resultado['transferencias'] + resultado['pagamentos']
-        if gerar_ofx_mercadopago(todas_transacoes, os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx')):
+        if gerar_ofx_mercadopago(todas_transacoes, os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx'), saldo_inicial_extrato):
             arquivos_gerados['Conta Azul/EXTRATO_MERCADOPAGO.ofx'] = os.path.join(temp_dir, 'EXTRATO_MERCADOPAGO.ofx')
 
         # =====================================================================
