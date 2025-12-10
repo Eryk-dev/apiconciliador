@@ -322,12 +322,16 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             }
 
     # 1.4 Criar mapa do PÓS-VENDA para contexto de devoluções
+    # Também extraímos a data original da venda (operation_date_created) para casos
+    # onde a venda não está no relatório VENDAS mas está no AFTER_COLLECTION
     map_pos_venda = {}
     for _, row in pos_venda.iterrows():
-        op_id = row.get('op_id', '')
+        op_id = clean_id(row.get('ID da transação (operation_id)', ''))
         if op_id:
             map_pos_venda[op_id] = {
                 'motivo': str(row.get('Motivo detalhado (reason_detail)', '')),
+                'data_venda_original': row.get('Data de criação da transação (operation_date_created)', ''),
+                'data_reclamacao': row.get('Data de criação (date_created)', ''),
             }
 
     # ==============================================================================
@@ -412,19 +416,57 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
     extrato['DataStr'] = extrato['Data'].dt.strftime('%d/%m/%Y')
     extrato['ID'] = extrato['REFERENCE_ID'].astype(str).str.replace('.0', '', regex=False).str.strip()
 
-    def criar_lancamento(op_id: str, data_str: str, categoria: str, valor: float,
-                         descricao: str, observacoes: str, centro: str = CENTRO_CUSTO) -> Dict:
-        """Helper para criar lançamento padronizado"""
+    def criar_lancamento(op_id: str, data_competencia: str, categoria: str, valor: float,
+                         descricao: str, observacoes: str, centro: str = CENTRO_CUSTO,
+                         data_pagamento: str = None) -> Dict:
+        """
+        Helper para criar lançamento padronizado.
+
+        Args:
+            data_competencia: Data do fato gerador (venda, devolução, etc.)
+            data_pagamento: Data da movimentação financeira (se None, usa data_competencia)
+        """
         return {
             'ID Operação': op_id,
-            'Data de Competência': data_str,
-            'Data de Pagamento': data_str,
+            'Data de Competência': data_competencia,
+            'Data de Pagamento': data_pagamento or data_competencia,
             'Categoria': categoria,
             'Valor': round(valor, 2),
             'Centro de Custo': centro,
             'Descrição': descricao,
             'Observações': observacoes
         }
+
+    def buscar_data_competencia_venda(op_id: str, data_fallback: str) -> str:
+        """
+        Busca a data de competência correta para uma VENDA (liberação de dinheiro).
+
+        Prioridade:
+        1. Data da venda no VENDAS (date_created)
+        2. Data da venda original no AFTER_COLLECTION (operation_date_created)
+        3. Fallback: data do extrato
+
+        Args:
+            op_id: ID da operação
+            data_fallback: Data do extrato para usar como fallback
+
+        Returns:
+            Data formatada dd/mm/yyyy
+        """
+        # 1. Tentar buscar no VENDAS
+        if op_id in map_vendas:
+            data_venda = map_vendas[op_id].get('data_venda', '')
+            if data_venda and str(data_venda).strip() not in ['', 'nan', 'NaT']:
+                return format_date(data_venda)
+
+        # 2. Tentar buscar no AFTER_COLLECTION (pós-venda)
+        if op_id in map_pos_venda:
+            data_venda_original = map_pos_venda[op_id].get('data_venda_original', '')
+            if data_venda_original and str(data_venda_original).strip() not in ['', 'nan', 'NaT']:
+                return format_date(data_venda_original)
+
+        # 3. Fallback: usar data do extrato
+        return data_fallback
 
     def calcular_soma_liberacoes(op_id: str) -> float:
         """
@@ -495,10 +537,12 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
         return None
 
-    def detalhar_liberacao_payment(op_id: str, data_str: str, valor_extrato: float,
-                                   descricao_base: str) -> List[Dict]:
+    def detalhar_liberacao_payment(op_id: str, data_competencia: str, valor_extrato: float,
+                                   descricao_base: str, data_pagamento: str = None) -> List[Dict]:
         """
         Detalha uma liberação de pagamento usando dados do LIBERAÇÕES.
+
+        V2.7: Agora aceita data_competencia (data da venda) e data_pagamento (data do extrato) separadas.
 
         LÓGICA CORRETA:
         - GROSS_AMOUNT = valor bruto (inclui frete do comprador)
@@ -573,31 +617,34 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             # LANÇAMENTO 1: Receita
             if abs(receita) > 0.01:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str,
+                    op_id, data_competencia,
                     get_categoria_receita(op_id),
                     abs(receita),  # Receita sempre positiva
                     descricao_base,
-                    "Receita de venda"
+                    "Receita de venda",
+                    data_pagamento=data_pagamento
                 ))
 
             # LANÇAMENTO 2: Comissão (sempre negativa)
             if abs(comissao) > 0.01:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str,
+                    op_id, data_competencia,
                     CA_CATS['COMISSAO'],
                     -abs(comissao),  # Despesa sempre negativa
                     descricao_base,
-                    f"Tarifa ML (MP: {lib['mp_fee']:.2f} + Parc: {lib['financing_fee']:.2f})"
+                    f"Tarifa ML (MP: {lib['mp_fee']:.2f} + Parc: {lib['financing_fee']:.2f})",
+                    data_pagamento=data_pagamento
                 ))
 
             # LANÇAMENTO 3: Frete (somente se VENDEDOR paga)
             if abs(frete_despesa) > 0.01:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str,
+                    op_id, data_competencia,
                     CA_CATS['FRETE_ENVIO'],
                     -abs(frete_despesa),  # Despesa sempre negativa
                     descricao_base,
-                    "Frete de envio (MercadoEnvios)"
+                    "Frete de envio (MercadoEnvios)",
+                    data_pagamento=data_pagamento
                 ))
 
         else:
@@ -626,57 +673,63 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                     if comissao > 0:
                         # LANÇAMENTO 1: Receita
                         lancamentos.append(criar_lancamento(
-                            op_id, data_str,
+                            op_id, data_competencia,
                             get_categoria_receita(op_id),
                             receita,
                             descricao_base,
-                            "Receita de venda (estimada)"
+                            "Receita de venda (estimada)",
+                            data_pagamento=data_pagamento
                         ))
 
                         # LANÇAMENTO 2: Comissão
                         lancamentos.append(criar_lancamento(
-                            op_id, data_str,
+                            op_id, data_competencia,
                             CA_CATS['COMISSAO'],
                             -comissao,
                             descricao_base,
-                            "Tarifa ML (calculada por diferença)"
+                            "Tarifa ML (calculada por diferença)",
+                            data_pagamento=data_pagamento
                         ))
 
                         # LANÇAMENTO 3: Frete (somente se vendedor paga)
                         if vendedor_paga_frete and frete_abs > 0.01:
                             lancamentos.append(criar_lancamento(
-                                op_id, data_str,
+                                op_id, data_competencia,
                                 CA_CATS['FRETE_ENVIO'],
                                 -frete_abs,
                                 descricao_base,
-                                "Frete de envio (MercadoEnvios)"
+                                "Frete de envio (MercadoEnvios)",
+                                data_pagamento=data_pagamento
                             ))
                     else:
                         # Não conseguiu calcular comissão positiva, usa valor do extrato direto
                         lancamentos.append(criar_lancamento(
-                            op_id, data_str,
+                            op_id, data_competencia,
                             get_categoria_receita(op_id),
                             valor_extrato,
                             descricao_base,
-                            "Liberação de venda (sem detalhamento)"
+                            "Liberação de venda (sem detalhamento)",
+                            data_pagamento=data_pagamento
                         ))
                 else:
                     # Receita = 0, usa valor do extrato direto
                     lancamentos.append(criar_lancamento(
-                        op_id, data_str,
+                        op_id, data_competencia,
                         get_categoria_receita(op_id),
                         valor_extrato,
                         descricao_base,
-                        "Liberação de venda (sem detalhamento)"
+                        "Liberação de venda (sem detalhamento)",
+                        data_pagamento=data_pagamento
                     ))
             else:
                 # Último fallback: valor total como receita
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str,
+                    op_id, data_competencia,
                     get_categoria_receita(op_id),
                     valor_extrato,
                     descricao_base,
-                    "Liberação de venda (sem detalhamento)"
+                    "Liberação de venda (sem detalhamento)",
+                    data_pagamento=data_pagamento
                 ))
 
         # V2.5.1: VALIDAÇÃO FINAL - Se soma dos lançamentos divergir do extrato, usar valor direto
@@ -686,7 +739,7 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             valor_esperado_vendas = map_vendas.get(op_id, {}).get('net_received', soma_lancamentos)
             rows_divergencias_fallback.append({
                 'ID': op_id,
-                'Data': data_str,
+                'Data': data_competencia,
                 'Tipo': 'Liberação de dinheiro',
                 'Valor_Extrato': valor_extrato,
                 'Valor_Calculado': soma_lancamentos,
@@ -699,11 +752,12 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
             # Substituir lançamentos pelo valor direto do extrato
             lancamentos = [criar_lancamento(
-                op_id, data_str,
+                op_id, data_competencia,
                 get_categoria_receita(op_id),
                 valor_extrato,
                 descricao_base,
-                "Liberação de venda (ajustado - ver DIVERGENCIAS)"
+                "Liberação de venda (ajustado - ver DIVERGENCIAS)",
+                data_pagamento=data_pagamento
             )]
 
         return lancamentos
@@ -822,11 +876,14 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
         return lancamentos
 
-    def detalhar_transacao_assertiva(op_id: str, tipo_extrato: str, data_str: str,
-                                     valor_extrato: float, descricao_base: str) -> List[Dict]:
+    def detalhar_transacao_assertiva(op_id: str, tipo_extrato: str, data_competencia: str,
+                                     valor_extrato: float, descricao_base: str,
+                                     data_pagamento: str = None) -> List[Dict]:
         """
         Detalha uma transação de forma assertiva usando o mapeamento correto entre
         EXTRATO e LIBERAÇÕES.
+
+        V2.7: Agora aceita data_competencia (data da venda) e data_pagamento (data do extrato) separadas.
 
         Para IDs com múltiplas transações, busca o registro específico no LIBERAÇÕES
         que corresponde a esta linha do extrato.
@@ -880,22 +937,25 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
             if abs(receita) > 0.01:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, get_categoria_receita(op_id),
-                    abs(receita), descricao_base, "Receita de venda"
+                    op_id, data_competencia, get_categoria_receita(op_id),
+                    abs(receita), descricao_base, "Receita de venda",
+                    data_pagamento=data_pagamento
                 ))
 
             if abs(comissao) > 0.01:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['COMISSAO'],
+                    op_id, data_competencia, CA_CATS['COMISSAO'],
                     -abs(comissao), descricao_base,
-                    f"Tarifa ML (MP: {lib['mp_fee']:.2f} + Parc: {lib['financing_fee']:.2f})"
+                    f"Tarifa ML (MP: {lib['mp_fee']:.2f} + Parc: {lib['financing_fee']:.2f})",
+                    data_pagamento=data_pagamento
                 ))
 
             # Frete somente se VENDEDOR paga
             if abs(frete_despesa) > 0.01:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['FRETE_ENVIO'],
-                    -abs(frete_despesa), descricao_base, "Frete de envio (MercadoEnvios)"
+                    op_id, data_competencia, CA_CATS['FRETE_ENVIO'],
+                    -abs(frete_despesa), descricao_base, "Frete de envio (MercadoEnvios)",
+                    data_pagamento=data_pagamento
                 ))
 
             # V2.5: VALIDAÇÃO - A soma dos lançamentos deve bater com o valor do extrato
@@ -908,44 +968,52 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
 
         # =========================================================================
         # DÉBITO POR DÍVIDA / MEDIAÇÃO - Valor negativo direto
+        # V2.7: Usa data do extrato (devolução é fato gerador novo)
         # =========================================================================
         elif 'débito por dívida' in tipo_lower or 'debito por divida' in tipo_lower:
             # mediation: GROSS_AMOUNT é o valor da dívida (negativo)
             # Não tem detalhamento, é um valor direto
+            # Data de competência = data do extrato (quando a devolução aconteceu)
+            data_extrato = data_pagamento or data_competencia
             lancamentos.append(criar_lancamento(
-                op_id, data_str, CA_CATS['DEVOLUCAO'],
+                op_id, data_extrato, CA_CATS['DEVOLUCAO'],
                 valor_extrato, descricao_base, "Débito por reclamação/mediação ML"
             ))
 
         # =========================================================================
         # REEMBOLSO (refund) - NÃO detalhar, usar valor direto do extrato
         # O extrato já mostra o valor líquido. Detalhar geraria duplicação.
+        # V2.7: Usa data do extrato (reembolso é fato gerador novo)
         # =========================================================================
         elif 'reembolso' in tipo_lower:
             # Usar valor direto do extrato - classificar pela natureza do valor
+            # Data de competência = data do extrato (quando o reembolso aconteceu)
+            data_extrato = data_pagamento or data_competencia
             if valor_extrato > 0:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['ESTORNO_TAXA'],
+                    op_id, data_extrato, CA_CATS['ESTORNO_TAXA'],
                     valor_extrato, descricao_base, "Estorno/Reembolso"
                 ))
             else:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['DEVOLUCAO'],
+                    op_id, data_extrato, CA_CATS['DEVOLUCAO'],
                     valor_extrato, descricao_base, "Devolução ao comprador"
                 ))
 
         # =========================================================================
         # DINHEIRO RETIDO (reserve_for_dispute)
+        # V2.7: Usa data do extrato
         # =========================================================================
         elif 'dinheiro retido' in tipo_lower:
+            data_extrato = data_pagamento or data_competencia
             if valor_extrato < 0:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['DEVOLUCAO'],
+                    op_id, data_extrato, CA_CATS['DEVOLUCAO'],
                     valor_extrato, descricao_base, "Dinheiro retido (bloqueio por disputa)"
                 ))
             else:
                 lancamentos.append(criar_lancamento(
-                    op_id, data_str, CA_CATS['ESTORNO_TAXA'],
+                    op_id, data_extrato, CA_CATS['ESTORNO_TAXA'],
                     valor_extrato, descricao_base, "Dinheiro liberado (desbloqueio)"
                 ))
 
@@ -1037,12 +1105,17 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             # =====================================================================
             # CATEGORIA 4: LIBERAÇÃO DE DINHEIRO (VENDA)
             # Esta é a categoria principal - detalha usando LIBERAÇÕES
+            # V2.7: Usa data da VENDA como competência, data do EXTRATO como pagamento
             # =====================================================================
             is_liberacao = 'liberação de dinheiro' in tipo_lower or 'liberacao de dinheiro' in tipo_lower
             has_payment_data = op_id in map_liberacoes and 'payment' in map_liberacoes[op_id]
             is_id_multiplo = op_id in ids_multiplos
 
             if is_liberacao and has_payment_data:
+                # V2.7: Buscar data de competência correta (data da venda)
+                data_competencia = buscar_data_competencia_venda(op_id, data_str)
+                data_pagamento = data_str  # Data do extrato = quando o dinheiro entrou
+
                 # V2.5: Verificar se tem refund/chargeback no LIBERAÇÕES
                 # Isso indica que pode haver valor consolidado no extrato
                 tipos_lib = list(map_liberacoes.get(op_id, {}).keys())
@@ -1058,35 +1131,40 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                         # Extrato mostra valor consolidado (payment - refund já aplicado)
                         # Usar valor direto do extrato sem detalhar para evitar duplicação
                         rows_conta_azul_confirmados.append(criar_lancamento(
-                            op_id, data_str, get_categoria_receita(op_id), val,
-                            descricao_base, "Liberação de venda (consolidada)"
+                            op_id, data_competencia, get_categoria_receita(op_id), val,
+                            descricao_base, "Liberação de venda (consolidada)",
+                            data_pagamento=data_pagamento
                         ))
                         continue
 
                 if is_id_multiplo:
                     # Para IDs múltiplos no extrato, usar detalhamento assertivo
-                    lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_str, val, descricao_base)
+                    lancamentos = detalhar_transacao_assertiva(op_id, tipo_transacao, data_competencia, val, descricao_base, data_pagamento)
                     if lancamentos:
                         rows_conta_azul_confirmados.extend(lancamentos)
                     else:
                         # Fallback: valor direto
                         rows_conta_azul_confirmados.append(criar_lancamento(
-                            op_id, data_str, get_categoria_receita(op_id), val,
-                            descricao_base, "Liberação de venda"
+                            op_id, data_competencia, get_categoria_receita(op_id), val,
+                            descricao_base, "Liberação de venda",
+                            data_pagamento=data_pagamento
                         ))
                 else:
                     # Para IDs únicos sem refund consolidado, usar detalhamento completo
-                    lancamentos = detalhar_liberacao_payment(op_id, data_str, val, descricao_base)
+                    lancamentos = detalhar_liberacao_payment(op_id, data_competencia, val, descricao_base, data_pagamento)
                     rows_conta_azul_confirmados.extend(lancamentos)
                 continue
             elif is_liberacao:
                 # Liberação sem dados detalhados - usa valor do extrato
+                # V2.7: Ainda tenta buscar data da venda
+                data_competencia = buscar_data_competencia_venda(op_id, data_str)
                 rows_conta_azul_confirmados.append(criar_lancamento(
-                    op_id, data_str,
+                    op_id, data_competencia,
                     get_categoria_receita(op_id),
                     val,
                     descricao_base,
-                    "Liberação de venda"
+                    "Liberação de venda",
+                    data_pagamento=data_str
                 ))
                 continue
 
@@ -1151,16 +1229,21 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                 continue
 
             # Pagamento/QR (PIX enviado ou recebido)
+            # V2.7: Para pagamentos QR recebidos (vendas), usar data da venda
             if 'pagamento' in tipo_lower or 'qr' in tipo_lower:
                 if val < 0:
+                    # Pagamento enviado - usa data do extrato
                     rows_pagamento_conta.append(criar_lancamento(
                         op_id, data_str, CA_CATS['PAGAMENTO_CONTA'], val,
                         descricao_base, "Pagamento enviado via PIX/QR"
                     ))
                 else:
+                    # Pagamento recebido (venda) - buscar data da venda
+                    data_competencia = buscar_data_competencia_venda(op_id, data_str)
                     rows_conta_azul_confirmados.append(criar_lancamento(
-                        op_id, data_str, get_categoria_receita(op_id), val,
-                        descricao_base, "Pagamento recebido via PIX/QR"
+                        op_id, data_competencia, get_categoria_receita(op_id), val,
+                        descricao_base, "Pagamento recebido via PIX/QR",
+                        data_pagamento=data_str
                     ))
                 continue
 
