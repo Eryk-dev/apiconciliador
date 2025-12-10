@@ -1,6 +1,6 @@
 # Super Conciliador API
 
-**Versão:** 2.5.1
+**Versão:** 2.6.1
 **Porta:** 1909
 **Tecnologia:** FastAPI + Python 3.11
 
@@ -22,6 +22,8 @@
 12. [API V2.4 - Correção de Divergência de Frete](#api-v24---correção-de-divergência-de-frete)
 13. [API V2.5 - Correção de Valores Consolidados](#api-v25---correção-de-valores-consolidados)
 14. [API V2.5.1 - Validação de Divergências e Log](#api-v251---validação-de-divergências-e-log)
+15. [API V2.6.0 - Exportação OFX](#api-v260---exportação-ofx)
+16. [API V2.6.1 - PIX/QR detalhado e reembolso granular](#api-v261---pixqr-detalhado-e-reembolso-granular)
 
 ---
 
@@ -1174,3 +1176,41 @@ O arquivo `DIVERGENCIAS_FALLBACK.csv` deve ser verificado quando:
 | Relatório LIBERAÇÕES com formato errado | Muitas divergências | Verificar colunas do CSV |
 | Ajuste manual do ML | Valor diferente | Conferir no painel do ML |
 | Parcelamento não liberado | VENDAS > EXTRATO | Normal, conferir liberações futuras |
+
+---
+
+## API V2.6.0 - Exportação OFX
+
+### O que mudou
+- Geramos `EXTRATO_MERCADOPAGO.ofx` na pasta Conta Azul para importação bancária.
+- O OFX soma **confirmados + transferências + pagamentos** e considera o `INITIAL_BALANCE` do extrato; saldo final = saldo inicial + transações.
+
+### Detalhes
+- Formato Money 2000 (versão 102) compatível com Mercado Pago.
+- Datas: intervalo cobre todas as datas de pagamento das transações geradas.
+- FITID gerado a partir de descrição + valor + índice para unicidade.
+
+---
+
+## API V2.6.1 - PIX/QR detalhado e reembolso granular
+
+### Pagamentos PIX/QR recebidos
+- Linhas do extrato como “Pagamento com Código QR Pix …” agora usam o `payment` do LIBERAÇÕES para detalhar receita, comissão e frete quando disponível.
+- Se não houver LIBERAÇÕES, mantém o comportamento simples (valor direto como receita).
+
+### Reembolsos (linhas “Reembolso …” no extrato)
+- Quando existe `refund` no LIBERAÇÕES, o valor é dividido em:
+  - **Estorno de taxas** (`1.3.4 Descontos e Estornos de Taxas e Tarifas`) – `mp_fee` + `financing_fee`.
+  - **Estorno de frete** (`1.3.7 Estorno de Frete sobre Vendas`) ou frete reverso, conforme sinal do `shipping_fee`.
+  - Valor do produto devolvido permanece em `1.2.1 Devoluções e Cancelamentos` (se aplicável).
+- Se a soma não bater com o valor do extrato, volta para o fallback anterior (valor direto).
+
+### Benefício
+- Mantém rastreabilidade de taxas/frete em reembolsos e evita consolidação em uma única categoria.
+
+---
+
+## Contato e Suporte
+
+- **Repositório:** https://github.com/Eryk-dev/apiconciliador
+- **Versão:** 2.6.1

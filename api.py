@@ -1176,19 +1176,73 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
             # Detalhar geraria duplicação de estornos de taxa.
             # =====================================================================
             if tipo_transacao.strip().startswith('Reembolso') or 'reembolso' in tipo_lower:
-                # Usar valor direto do extrato - classificar pela natureza do valor
-                if val > 0:
-                    # Positivo = estorno (dinheiro voltando para o vendedor)
-                    rows_conta_azul_confirmados.append(criar_lancamento(
-                        op_id, data_str, CA_CATS['ESTORNO_TAXA'], val,
-                        descricao_base, "Estorno/Reembolso"
-                    ))
+                lancamentos = []
+
+                # Novo: se existir refund detalhado no LIBERAÇÕES, separar estorno de taxa e frete
+                if op_id in map_liberacoes and 'refund' in map_liberacoes[op_id]:
+                    refund_data = map_liberacoes[op_id]['refund']
+                    refund = None
+
+                    if isinstance(refund_data, list):
+                        # Tenta achar o refund com NET próximo ao valor do extrato
+                        for r in refund_data:
+                            if abs(r.get('net_amount', 0) - val) < 0.10:
+                                refund = r
+                                break
+                        if refund is None and refund_data:
+                            refund = refund_data[0]
+                    else:
+                        refund = refund_data
+
+                    if refund:
+                        gross_refund = refund.get('gross_amount', 0)
+                        estorno_taxas = refund.get('mp_fee', 0) + refund.get('financing_fee', 0)
+                        estorno_frete = refund.get('shipping_fee', 0)
+                        data_extrato = data_str
+
+                        # Valor do produto devolvido (se existir)
+                        if abs(gross_refund) > 0.01:
+                            cat_gross = CA_CATS['DEVOLUCAO'] if gross_refund < 0 else CA_CATS['ESTORNO_TAXA']
+                            lancamentos.append(criar_lancamento(
+                                op_id, data_extrato, cat_gross, gross_refund,
+                                descricao_base, "Reembolso de produto"
+                            ))
+
+                        # Estorno de taxas (MP + parcelamento)
+                        if abs(estorno_taxas) > 0.01:
+                            lancamentos.append(criar_lancamento(
+                                op_id, data_extrato, CA_CATS['ESTORNO_TAXA'], estorno_taxas,
+                                descricao_base, "Estorno de taxas ML"
+                            ))
+
+                        # Estorno ou cobrança de frete
+                        if abs(estorno_frete) > 0.01:
+                            cat_frete = CA_CATS['ESTORNO_FRETE'] if estorno_frete > 0 else CA_CATS['FRETE_REVERSO']
+                            obs_frete = "Estorno de frete" if estorno_frete > 0 else "Frete de logística reversa"
+                            lancamentos.append(criar_lancamento(
+                                op_id, data_extrato, cat_frete, estorno_frete,
+                                descricao_base, obs_frete
+                            ))
+
+                        # Garantir que a soma bate com o extrato; se não, volta para fallback simples
+                        soma_lanc = sum(l['Valor'] for l in lancamentos)
+                        if abs(soma_lanc - val) > 0.10:
+                            lancamentos = []
+
+                # Fallback: comportamento anterior (valor direto em uma categoria)
+                if not lancamentos:
+                    if val > 0:
+                        rows_conta_azul_confirmados.append(criar_lancamento(
+                            op_id, data_str, CA_CATS['ESTORNO_TAXA'], val,
+                            descricao_base, "Estorno/Reembolso"
+                        ))
+                    else:
+                        rows_conta_azul_confirmados.append(criar_lancamento(
+                            op_id, data_str, CA_CATS['DEVOLUCAO'], val,
+                            descricao_base, "Devolução ao comprador"
+                        ))
                 else:
-                    # Negativo = devolução (dinheiro saindo do vendedor)
-                    rows_conta_azul_confirmados.append(criar_lancamento(
-                        op_id, data_str, CA_CATS['DEVOLUCAO'], val,
-                        descricao_base, "Devolução ao comprador"
-                    ))
+                    rows_conta_azul_confirmados.extend(lancamentos)
                 continue
 
             # =====================================================================
@@ -1241,11 +1295,18 @@ def processar_conciliacao(arquivos: Dict[str, pd.DataFrame], centro_custo: str =
                 else:
                     # Pagamento recebido (venda) - buscar data da venda
                     data_competencia = buscar_data_competencia_venda(op_id, data_str)
-                    rows_conta_azul_confirmados.append(criar_lancamento(
-                        op_id, data_competencia, get_categoria_receita(op_id), val,
-                        descricao_base, "Pagamento recebido via PIX/QR",
-                        data_pagamento=data_str
-                    ))
+                    # Se tivermos payment no LIBERAÇÕES, detalhar igual às liberações de venda
+                    if has_payment_data:
+                        lancamentos = detalhar_liberacao_payment(
+                            op_id, data_competencia, val, descricao_base, data_pagamento=data_str
+                        )
+                        rows_conta_azul_confirmados.extend(lancamentos)
+                    else:
+                        rows_conta_azul_confirmados.append(criar_lancamento(
+                            op_id, data_competencia, get_categoria_receita(op_id), val,
+                            descricao_base, "Pagamento recebido via PIX/QR",
+                            data_pagamento=data_str
+                        ))
                 continue
 
             # Entrada de dinheiro
